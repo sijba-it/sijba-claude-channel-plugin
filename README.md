@@ -29,10 +29,9 @@ allowlist) — nothing is written into the project dir. main.py presses Enter on
 startup confirmation dialogs.
 
 ## Setup
-```
-python3 -m venv .venv && .venv/bin/pip install websockets
-npm install
-```
+Standalone: `python3 -m venv .venv && .venv/bin/pip install websockets`. The npm dependencies are
+installed automatically on first start (controller git plugins have no install step).
+Under the controller set `CLAUDE_CMD` to an absolute path (systemd PATH usually lacks `~/.local/bin`).
 Needs: interactive `claude` logged in with a claude.ai account, tmux, node >= 18.
 Team/Enterprise: org policy `channelsEnabled` must allow channels.
 

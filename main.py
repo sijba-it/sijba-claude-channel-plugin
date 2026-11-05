@@ -65,6 +65,21 @@ if not WORK_DIR.is_dir():
     print(f"ERROR: WORK_DIR {WORK_DIR} does not exist", file=sys.stderr)
     sys.exit(1)
 
+
+def _ensure_node_deps() -> None:
+    """Controller git plugins are just `git clone`d - no install step - so fetch
+    the channel server's npm deps ourselves on first start."""
+    if (HERE / "node_modules" / "@modelcontextprotocol" / "sdk").is_dir():
+        return
+    print("installing channel server dependencies (npm install)...", flush=True)
+    r = subprocess.run(["npm", "install", "--omit=dev", "--no-audit", "--no-fund"], cwd=HERE)
+    if r.returncode != 0:
+        print("ERROR: npm install failed", file=sys.stderr)
+        sys.exit(1)
+
+
+_ensure_node_deps()
+
 PLUGIN_ID = f"{PLUGIN_NAME}-{PROJECT_NAME}"
 CHANNEL_ID = f"{PLUGIN_NAME}:{PROJECT_NAME}"
 TMUX_SESSION = f"sijba-{PROJECT_NAME}"
