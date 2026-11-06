@@ -21,7 +21,9 @@ sijba <-ws-> main.py <-unix socket-> channel.mjs (MCP channel, spawned by claude
 - `SIJBA_PERMISSION_RELAY=1`: tool-approval prompts go to sijba, answer `yes <id>` / `no <id>`
   (local terminal dialog stays open, first answer wins). Only enable where the sijba
   channel's senders are trusted.
-- Session is `tmux attach -t sijba-<project>`-able. Commands: `/reset /esc /attach /log [n] /trace [n] /archive /pause`.
+- Session is `tmux attach -t sijba-<project>`-able. Commands: `/reset /esc /screen [n] /key <keys> /attach /log [n] /trace [n] /archive /pause`.
+  `/screen` shows the tmux pane, `/key` sends tmux key names (`/key 1`, `/key Down Enter`, `/key C-c`) —
+  answers blocking TUI dialogs (e.g. the model-switch prompt) from sijba.
 
 Runs claude with `--mcp-config`, `--settings` (hooks) and
 `--dangerously-load-development-channels server:sijba` (custom channel, not on the
@@ -37,7 +39,12 @@ Team/Enterprise: org policy `channelsEnabled` must allow channels.
 
 - **Transcript watcher**: tails the newest `~/.claude/projects/<workdir>/*.jsonl`. If a `reply` tool call
   *fails* (bridge offline, denied, ...) the text from the tool_use input is delivered to sijba anyway;
-  tool errors are logged and kept for `/trace [n]` (last tool calls / errors).
+  tool errors are logged and kept for `/trace [n]` (last tool calls / errors). claude's own `system`
+  notices (subtype `informational` or level warning/error, e.g. "safeguards stopped the response")
+  are relayed as `⚠️ ...`.
+- **Stall watchdog**: if a turn shows no hook and no transcript line for `SIJBA_STALL_SECS` (default 90,
+  0 = off), one `⏳` message with the last pane lines is sent — a TUI dialog waiting for a keypress
+  produces no event at all. Can also fire on a long silent Bash command; harmless.
 - `claude` runs with `ENABLE_TOOL_SEARCH=false`: otherwise MCP tools are deferred, claude doesn't know
   the `reply` schema and answers in the terminal only.
 

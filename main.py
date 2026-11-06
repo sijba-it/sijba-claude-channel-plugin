@@ -19,7 +19,7 @@ protocol:
 
 Env: SIJBA_URL SIJBA_TOKEN PROJECT_NAME WORK_DIR REGISTRY_FILE  (controller contract)
      CLAUDE_CMD (default claude), SIJBA_PERMISSION_RELAY=1, SIJBA_TOOL_STATUS=1,
-     CLAUDE_EXTRA_ARGS (e.g. "--model sonnet")
+     CLAUDE_EXTRA_ARGS (e.g. "--model sonnet"), SIJBA_STALL_SECS (default 90, 0 = off)
 """
 from __future__ import annotations
 
@@ -55,6 +55,7 @@ CLAUDE_EXTRA_ARGS = os.environ.get("CLAUDE_EXTRA_ARGS", "")
 PERMISSION_RELAY = os.environ.get("SIJBA_PERMISSION_RELAY") == "1"
 TOOL_STATUS = os.environ.get("SIJBA_TOOL_STATUS") == "1"
 TRUST_WORKDIR = os.environ.get("SIJBA_TRUST_WORKDIR") == "1"
+STALL_SECS = int(os.environ.get("SIJBA_STALL_SECS", "90"))
 
 for _name, _ok in (("SIJBA_TOKEN", SIJBA_TOKEN), ("PROJECT_NAME", PROJECT_NAME),
                    ("REGISTRY_FILE", REGISTRY_FILE)):
@@ -245,6 +246,8 @@ class TranscriptWatcher:
       * a `reply` tool call that *failed* (bridge offline, denied, ...) is not lost:
         the text is in the tool_use input, so we deliver it to sijba ourselves
       * a rolling trace (tool calls / errors) for `/trace`, plus a log line per error
+    Also relays claude's own `system` notices (e.g. "safeguards stopped the response")
+    and bumps the client's progress clock for the stall watchdog.
     """
 
     def __init__(self, client: "PluginClient"):
@@ -292,6 +295,7 @@ class TranscriptWatcher:
         if end < 0:
             return                      # incomplete last line - wait for the rest
         self.offset += end + 1
+        self.client.last_progress_at = time.monotonic()
         for raw in chunk[:end].splitlines():
             try:
                 d = json.loads(raw)
@@ -299,6 +303,27 @@ class TranscriptWatcher:
                 continue
             if d.get("type") in ("assistant", "user"):
                 await self._event(d)
+            elif d.get("type") == "system":
+                await self._system(d)
+
+    async def _system(self, d: dict) -> None:
+        """Notices claude writes as their own transcript line - only the user-facing ones
+        (informational / warning / error), not compact boundaries, durations, etc."""
+        content = d.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return
+        if d.get("subtype") != "informational" and d.get("level") not in ("warning", "error"):
+            return
+        key = f"system:{d.get('uuid')}"
+        if d.get("uuid"):
+            if key in self.seen:
+                return
+            self.seen.add(key)
+        self.trace.append(f"{datetime.now().strftime('%H:%M:%S')} !! {d.get('level') or d.get('subtype')}: {content[:160]}")
+        env = self.client._current
+        _log(f"system notice in transcript (envelope={env}): {content[:160]}")
+        if env:
+            await self.client._reply(env, f"⚠️ {content.strip()}")
 
     async def _event(self, d: dict) -> None:
         content = (d.get("message") or {}).get("content")
@@ -408,6 +433,8 @@ class PluginClient:
         self._current: str | None = None              # envelope currently being worked on
         self._replied: set[str] = set()               # envelopes claude answered via reply tool
         self._pending_perms: dict[str, dict] = {}
+        self.last_progress_at = time.monotonic()      # last hook / transcript line seen
+        self._stall_notified_at: float | None = None  # last_progress_at value we already warned about
         self.watcher = TranscriptWatcher(self)
 
     # -- sijba out -------------------------------------------------------
@@ -443,6 +470,7 @@ class PluginClient:
     async def on_hook(self, ev: dict) -> None:
         name = ev.get("hook_event_name")
         env = self._current
+        self.last_progress_at = time.monotonic()
         _log(f"hook {name} (envelope={env})")
         if not env:
             return
@@ -494,10 +522,25 @@ class PluginClient:
         elif cmd == "esc":
             self.claude.keys("Escape")
             await self._reply(envelope_id, "Escape sent (interrupts the running turn).", channel_id)
+        elif cmd == "screen":
+            n = min(int(rest.strip()), 100) if rest.strip().isdigit() else 25
+            lines = [l for l in self.claude.capture().splitlines() if l.strip()][-n:]
+            await self._reply(envelope_id, "```\n" + _truncate("\n".join(lines) or "(empty pane)", 3000) + "\n```", channel_id)
+        elif cmd == "key":
+            # tmux key names, space separated: "1", "Enter", "Down Enter", "C-c"
+            keys = rest.split()
+            if not keys:
+                await self._reply(envelope_id, "Usage: /key <keys>  e.g. /key 1   /key Down Enter   /key Escape", channel_id)
+                return True
+            self.claude.keys(*keys)
+            self.last_progress_at = time.monotonic()
+            await asyncio.sleep(1)
+            lines = [l for l in self.claude.capture().splitlines() if l.strip()][-10:]
+            await self._reply(envelope_id, f"keys sent: {' '.join(keys)}\n```\n" + _truncate("\n".join(lines), 1500) + "\n```", channel_id)
         elif cmd == "attach":
             await self._reply(envelope_id, f"tmux attach -t {TMUX_SESSION}", channel_id)
         else:
-            await self._reply(envelope_id, "Commands: /archive /pause /reset /esc /attach /log [n] /trace [n]. Anything else: plain text.", channel_id)
+            await self._reply(envelope_id, "Commands: /archive /pause /reset /esc /screen [n] /key <keys> /attach /log [n] /trace [n]. Anything else: plain text.", channel_id)
         return True
 
     async def handle_message(self, msg: dict) -> None:
@@ -536,6 +579,7 @@ class PluginClient:
                 return
         self._current = envelope_id
         self._replied.discard(envelope_id)
+        self.last_progress_at = time.monotonic()
         _log(f"inject envelope={envelope_id} text={text[:120]!r}")
         await self.bridge.send({"type": "inbound", "chat_id": envelope_id, "text": text})
 
@@ -558,7 +602,7 @@ class PluginClient:
             "channels": {CHANNEL_ID: {
                 "label": f"Claude (channel): {PROJECT_NAME}",
                 "hint": (f"Interactive Claude Code via Channels for '{PROJECT_NAME}' at {WORK_DIR}. "
-                         f"Trigger: '{PROJECT_NAME} ...'. Commands: /archive /pause /reset /esc /attach /log [n] /trace [n]."),
+                         f"Trigger: '{PROJECT_NAME} ...'. Commands: /archive /pause /reset /esc /screen [n] /key <keys> /attach /log [n] /trace [n]."),
                 "triggers": [PROJECT_NAME, CHANNEL_ID],
                 "capabilities": ["code", "analysis", "debugging", "files", "terminal"],
                 "metadata": {"plugin": PLUGIN_NAME, "project": PROJECT_NAME, "working_dir": str(WORK_DIR)},
@@ -594,6 +638,27 @@ class PluginClient:
                 self.exit_code = self.exit_code or 1
                 self._request_shutdown()
 
+    async def _watch_stall(self) -> None:
+        """A TUI dialog waiting for a keypress (e.g. the model-switch prompt after a
+        safeguard trip) leaves no hook and no transcript line - only silence. Warn once
+        per stall when a turn has shown no progress for STALL_SECS."""
+        while not self.shutdown_event.is_set():
+            await asyncio.sleep(10)
+            env = self._current
+            if not env or self._pending_perms:
+                continue
+            idle = time.monotonic() - self.last_progress_at
+            if idle < STALL_SECS or self._stall_notified_at == self.last_progress_at:
+                continue
+            self._stall_notified_at = self.last_progress_at
+            lines = [l for l in self.claude.capture().splitlines() if l.strip()][-15:]
+            _log(f"stall: no progress for {int(idle)}s (envelope={env})")
+            msg = (f"⏳ keine Aktivität seit {int(idle)}s — evtl. hängt ein TUI-Dialog. "
+                   f"Antworten mit /key <tasten> (z.B. /key 1, /key Enter), /screen zeigt den Pane, /esc bricht ab.")
+            if lines:
+                msg += "\n\n```\n" + _truncate("\n".join(lines), 1500) + "\n```"
+            await self._reply(env, msg)
+
     async def run_forever(self) -> None:
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -602,6 +667,8 @@ class PluginClient:
         self.claude.start()
         asyncio.create_task(self.claude.accept_startup_dialogs())
         asyncio.create_task(self._watch_tmux())
+        if STALL_SECS > 0:
+            asyncio.create_task(self._watch_stall())
         asyncio.create_task(self.watcher.run())
         while not self.shutdown_event.is_set():
             try:
