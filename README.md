@@ -42,9 +42,10 @@ Team/Enterprise: org policy `channelsEnabled` must allow channels.
   tool errors are logged and kept for `/trace [n]` (last tool calls / errors). claude's own `system`
   notices (subtype `informational` or level warning/error, e.g. "safeguards stopped the response")
   are relayed as `⚠️ ...`.
-- **Stall watchdog**: if a turn shows no hook and no transcript line for `SIJBA_STALL_SECS` (default 90,
-  0 = off), one `⏳` message with the last pane lines is sent — a TUI dialog waiting for a keypress
-  produces no event at all. Can also fire on a long silent Bash command; harmless.
+- **Stall watchdog**: if a turn shows no hook and no transcript line for `SIJBA_STALL_SECS` (default 45,
+  0 = off) *and* claude's spinner (`esc to interrupt`) is gone from the pane, one `⏳` message with the
+  last pane lines is sent — a TUI dialog waiting for a keypress produces no event at all. Spinner
+  visible = still working (long Bash command etc.), no warning. `/screen` shows the same state.
 - `claude` runs with `ENABLE_TOOL_SEARCH=false`: otherwise MCP tools are deferred, claude doesn't know
   the `reply` schema and answers in the terminal only.
 

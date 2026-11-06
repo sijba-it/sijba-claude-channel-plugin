@@ -19,7 +19,7 @@ protocol:
 
 Env: SIJBA_URL SIJBA_TOKEN PROJECT_NAME WORK_DIR REGISTRY_FILE  (controller contract)
      CLAUDE_CMD (default claude), SIJBA_PERMISSION_RELAY=1, SIJBA_TOOL_STATUS=1,
-     CLAUDE_EXTRA_ARGS (e.g. "--model sonnet"), SIJBA_STALL_SECS (default 90, 0 = off)
+     CLAUDE_EXTRA_ARGS (e.g. "--model sonnet"), SIJBA_STALL_SECS (default 45, 0 = off)
 """
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ CLAUDE_EXTRA_ARGS = os.environ.get("CLAUDE_EXTRA_ARGS", "")
 PERMISSION_RELAY = os.environ.get("SIJBA_PERMISSION_RELAY") == "1"
 TOOL_STATUS = os.environ.get("SIJBA_TOOL_STATUS") == "1"
 TRUST_WORKDIR = os.environ.get("SIJBA_TRUST_WORKDIR") == "1"
-STALL_SECS = int(os.environ.get("SIJBA_STALL_SECS", "90"))
+STALL_SECS = int(os.environ.get("SIJBA_STALL_SECS", "45"))
 
 for _name, _ok in (("SIJBA_TOKEN", SIJBA_TOKEN), ("PROJECT_NAME", PROJECT_NAME),
                    ("REGISTRY_FILE", REGISTRY_FILE)):
@@ -200,6 +200,12 @@ class ClaudeTmux:
 
     def capture(self) -> str:
         return _tmux("capture-pane", "-p", "-J", "-t", TMUX_SESSION).stdout
+
+    def busy(self, pane: str | None = None) -> bool:
+        """claude's spinner line ("✻ Thinking… (esc to interrupt)") is shown for as long as a
+        turn runs - incl. long tool calls. Dialogs say "esc to cancel" instead."""
+        lines = [l for l in (pane if pane is not None else self.capture()).splitlines() if l.strip()]
+        return any("esc to interrupt" in l.lower() for l in lines[-10:])
 
     def keys(self, *keys: str) -> None:
         _tmux("send-keys", "-t", TMUX_SESSION, *keys)
@@ -524,8 +530,10 @@ class PluginClient:
             await self._reply(envelope_id, "Escape sent (interrupts the running turn).", channel_id)
         elif cmd == "screen":
             n = min(int(rest.strip()), 100) if rest.strip().isdigit() else 25
-            lines = [l for l in self.claude.capture().splitlines() if l.strip()][-n:]
-            await self._reply(envelope_id, "```\n" + _truncate("\n".join(lines) or "(empty pane)", 3000) + "\n```", channel_id)
+            pane = self.claude.capture()
+            lines = [l for l in pane.splitlines() if l.strip()][-n:]
+            state = "🔄 arbeitet" if self.claude.busy(pane) else ("💤 idle" if not self._current else "⏸ wartet (kein Spinner)")
+            await self._reply(envelope_id, f"{state}\n```\n" + _truncate("\n".join(lines) or "(empty pane)", 3000) + "\n```", channel_id)
         elif cmd == "key":
             # tmux key names, space separated: "1", "Enter", "Down Enter", "C-c"
             keys = rest.split()
@@ -641,7 +649,8 @@ class PluginClient:
     async def _watch_stall(self) -> None:
         """A TUI dialog waiting for a keypress (e.g. the model-switch prompt after a
         safeguard trip) leaves no hook and no transcript line - only silence. Warn once
-        per stall when a turn has shown no progress for STALL_SECS."""
+        per stall when a turn has shown no progress for STALL_SECS and claude's spinner
+        is gone (spinner visible = still working, e.g. a long Bash command)."""
         while not self.shutdown_event.is_set():
             await asyncio.sleep(10)
             env = self._current
@@ -650,10 +659,13 @@ class PluginClient:
             idle = time.monotonic() - self.last_progress_at
             if idle < STALL_SECS or self._stall_notified_at == self.last_progress_at:
                 continue
+            pane = self.claude.capture()
+            if self.claude.busy(pane):
+                continue
             self._stall_notified_at = self.last_progress_at
-            lines = [l for l in self.claude.capture().splitlines() if l.strip()][-15:]
+            lines = [l for l in pane.splitlines() if l.strip()][-15:]
             _log(f"stall: no progress for {int(idle)}s (envelope={env})")
-            msg = (f"⏳ keine Aktivität seit {int(idle)}s — evtl. hängt ein TUI-Dialog. "
+            msg = (f"⏳ seit {int(idle)}s keine Aktivität und kein Spinner — vermutlich wartet ein TUI-Dialog. "
                    f"Antworten mit /key <tasten> (z.B. /key 1, /key Enter), /screen zeigt den Pane, /esc bricht ab.")
             if lines:
                 msg += "\n\n```\n" + _truncate("\n".join(lines), 1500) + "\n```"
