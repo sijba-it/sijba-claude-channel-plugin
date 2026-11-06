@@ -192,6 +192,9 @@ def _parse_dialog(pane: str) -> dict | None:
 
 
 class ClaudeTmux:
+    continued = False
+    started_at = 0.0
+
     def has_session(self) -> bool:
         return _tmux("has-session", "-t", TMUX_SESSION).returncode == 0
 
@@ -218,20 +221,30 @@ class ClaudeTmux:
         return ["--mcp-config", str(mcp), "--settings", str(settings),
                 "--dangerously-load-development-channels", "server:sijba"]
 
-    def start(self) -> None:
+    def start(self, fresh: bool = False) -> None:
+        """Resumes the last conversation of WORK_DIR (--continue) unless `fresh` (/reset),
+        there is none yet, or the previous resumed claude died right away (see _watch_tmux)."""
         if self.has_session():
             _log(f"tmux session {TMUX_SESSION} already running — reusing")
             return
+        no_continue = RUN_DIR / "no-continue-once"
+        if no_continue.exists():
+            no_continue.unlink()
+            fresh = True
+            _log("previous --continue start died right away - starting a fresh conversation")
+        self.continued = not fresh and any(_transcript_dir().glob("*.jsonl"))
+        self.started_at = time.monotonic()
         # ENABLE_TOOL_SEARCH=false: MCP tools are otherwise "deferred" (schema only
         # loaded after a ToolSearch call) and claude then answers in the terminal
         # instead of calling `reply`.
         cmd = shlex.join(["env", "ENABLE_TOOL_SEARCH=false", CLAUDE_CMD,
-                          *self._write_config(), *shlex.split(CLAUDE_EXTRA_ARGS)])
+                          *self._write_config(), *(["--continue"] if self.continued else []),
+                          *shlex.split(CLAUDE_EXTRA_ARGS)])
         r = _tmux("new-session", "-d", "-s", TMUX_SESSION, "-c", str(WORK_DIR),
                   "-x", "200", "-y", "50", cmd)
         if r.returncode != 0:
             raise RuntimeError(f"tmux new-session failed: {r.stderr.strip()}")
-        _log(f"started claude in tmux session {TMUX_SESSION}")
+        _log(f"started claude in tmux session {TMUX_SESSION}" + (" (--continue)" if self.continued else " (fresh)"))
 
     def capture(self) -> str:
         return _tmux("capture-pane", "-p", "-J", "-t", TMUX_SESSION).stdout
@@ -561,7 +574,7 @@ class PluginClient:
         elif cmd in ("reset", "kill"):
             self.claude.stop()
             await asyncio.sleep(1)
-            self.claude.start()
+            self.claude.start(fresh=True)
             asyncio.create_task(self.claude.accept_startup_dialogs())
             self._current = None
             await self._reply(envelope_id, f"{PROJECT_NAME}: claude restarted, fresh conversation.", channel_id)
@@ -697,6 +710,10 @@ class PluginClient:
             await asyncio.sleep(5)
             if not self.claude.has_session():
                 _log("tmux session vanished — exiting so the controller restarts us")
+                if self.claude.continued and time.monotonic() - self.claude.started_at < 30:
+                    # resumed conversation broke claude's start - don't crash-loop on it
+                    RUN_DIR.mkdir(parents=True, exist_ok=True)
+                    (RUN_DIR / "no-continue-once").touch()
                 self.exit_code = self.exit_code or 1
                 self._request_shutdown()
 

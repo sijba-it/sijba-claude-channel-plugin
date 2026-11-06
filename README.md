@@ -21,6 +21,8 @@ sijba <-ws-> main.py <-unix socket-> channel.mjs (MCP channel, spawned by claude
 - `SIJBA_PERMISSION_RELAY=1`: tool-approval prompts go to sijba, answer `yes <id>` / `no <id>`
   (local terminal dialog stays open, first answer wins). Only enable where the sijba
   channel's senders are trusted.
+- claude starts with `--continue` (last conversation of WORK_DIR) after any restart; `/reset` starts fresh.
+  If a resumed claude dies within 30s, the next start is fresh once (no crash loop).
 - Session is `tmux attach -t sijba-<project>`-able. Commands: `/reset /esc /screen [n] /key <keys> /attach /log [n] /trace [n] /archive /pause`.
   `/screen` shows the tmux pane, `/key` sends tmux key names (`/key 1`, `/key Down Enter`, `/key C-c`) —
   answers blocking TUI dialogs (e.g. the model-switch prompt) from sijba.
