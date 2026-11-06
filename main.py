@@ -171,6 +171,50 @@ def _screen(pane: str, n: int = 40) -> str:
     return _truncate("\n".join(out[-n:]) or "(leerer Bildschirm)", 3500).replace("`" * 3, "´´´")
 
 
+def _rel(path: object) -> str:
+    try:
+        return str(Path(str(path)).resolve().relative_to(WORK_DIR.resolve()))
+    except (ValueError, OSError):
+        return str(path)
+
+
+def _tool_summary(tool: str, tin: dict) -> str:
+    """What a permission request is about, readable on a phone."""
+    if tool == "Bash":
+        out = str(tin.get("command", ""))
+        if tin.get("description"):
+            out = f"# {tin['description']}\n{out}"
+    elif tool in ("Edit", "MultiEdit"):
+        edits = tin.get("edits") or [tin]
+        out = _rel(tin.get("file_path", "")) + "".join(
+            "\n" + "\n".join("- " + l for l in str(e.get("old_string", "")).splitlines()[:15])
+            + "\n" + "\n".join("+ " + l for l in str(e.get("new_string", "")).splitlines()[:15]) for e in edits[:3])
+    elif tool == "Write":
+        out = f"{_rel(tin.get('file_path', ''))}\n" + "\n".join(str(tin.get("content", "")).splitlines()[:25])
+    else:
+        out = json.dumps(tin, indent=1, ensure_ascii=False)
+    return _truncate(out, 2500).replace("`" * 3, "´´´")
+
+
+def _describe_suggestions(sugg: list[dict]) -> str:
+    """claude's "don't ask again" proposals (permission_suggestions) in words."""
+    modes = {"acceptEdits": "alle Datei-Änderungen in dieser Session (accept edits)",
+             "bypassPermissions": "alles ohne Rückfrage (bypass)", "plan": "Plan-Modus"}
+    parts = []
+    for sg in sugg:
+        t = sg.get("type")
+        if t in ("addRules", "replaceRules"):
+            parts += [f"{r.get('toolName')}({r['ruleContent']})" if r.get("ruleContent") else str(r.get("toolName"))
+                      for r in sg.get("rules", [])]
+        elif t == "setMode":
+            parts.append(modes.get(sg.get("mode"), f"Modus {sg.get('mode')}"))
+        elif t == "addDirectories":
+            parts.append("Zugriff auf " + ", ".join(map(str, sg.get("directories", []))))
+        else:
+            parts.append(str(t))
+    return "; ".join(parts) or "dieses Tool"
+
+
 def _free_text_option(dialog: dict) -> int | None:
     """Option that takes typed text: AskUserQuestion's "Type something", plan approval's
     "Tell Claude what to change"."""
@@ -275,9 +319,14 @@ class ClaudeTmux:
         }}}, indent=2))
         hook_cmd = f"SIJBA_CHANNEL_SOCK={shlex.quote(SOCK_PATH)} python3 {shlex.quote(str(HERE / 'hook.py'))}"
         hook = [{"hooks": [{"type": "command", "command": hook_cmd}]}]
-        hooks = {"Stop": hook, "Notification": hook}
+        # these wait for the user's answer from sijba (see hook.py) - no practical timeout
+        waiting = {"type": "command", "command": hook_cmd, "timeout": 86400}
+        hooks = {"Stop": hook, "Notification": hook,
+                 "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [waiting]}]}
+        if not PERMISSION_RELAY:        # the channel permission relay asks on its own
+            hooks["PermissionRequest"] = [{"hooks": [waiting]}]
         if TOOL_STATUS:
-            hooks["PreToolUse"] = hook
+            hooks["PreToolUse"].append({"hooks": [{"type": "command", "command": hook_cmd}]})
         settings = RUN_DIR / "settings.json"
         settings.write_text(json.dumps({
             "hooks": hooks,
@@ -518,6 +567,9 @@ class Bridge:
                     continue
                 t = m.get("type")
                 if t == "hook":
+                    if m.get("want_reply"):
+                        await self._hook_request(reader, writer, m["event"])
+                        break
                     asyncio.create_task(self.client.on_hook(m["event"]))
                     continue
                 if not is_bridge:
@@ -535,6 +587,24 @@ class Bridge:
                 self.connected.clear()
                 _log("channel bridge disconnected")
             writer.close()
+
+    async def _hook_request(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ev: dict) -> None:
+        """A waiting hook: answer it with the user's decision - unless claude kills the hook
+        first (dialog answered in the terminal, turn interrupted), seen as EOF."""
+        ask = asyncio.create_task(self.client.on_hook_request(ev))
+        eof = asyncio.create_task(reader.read())
+        done, _ = await asyncio.wait({ask, eof}, return_when=asyncio.FIRST_COMPLETED)
+        if ask not in done:
+            ask.cancel()
+            return
+        eof.cancel()
+        try:
+            out = ask.result()
+        except Exception as exc:
+            _log(f"hook request error: {exc!r}")
+            out = None
+        writer.write((json.dumps({"output": out}) + "\n").encode())
+        await writer.drain()
 
     async def send(self, obj: dict) -> bool:
         if self.writer is None:
@@ -564,7 +634,10 @@ class PluginClient:
         self.last_progress_at = time.monotonic()      # last hook / transcript line seen
         self._stall_notified_at: float | None = None  # last_progress_at value we already warned about
         self._dialog_sig: tuple | None = None         # options of the TUI dialog already relayed
-        self._notice_pending = False                  # notice_then_dialog() is still watching
+        self._hold_relay = False                      # a relay of the pane dialog is already underway
+        self._ask: dict | None = None                 # question waiting for the user's next message
+        self._ask_lock = asyncio.Lock()               # parallel tool calls -> one question at a time
+        self._last_env: str | None = None             # fallback when a hook fires outside a known turn
         self.watcher = TranscriptWatcher(self)
 
     # -- sijba out -------------------------------------------------------
@@ -604,7 +677,9 @@ class PluginClient:
         _log(f"hook {name} (envelope={env})")
         if not env:
             return
-        if name == "Stop":
+        if name == "PermissionRequest" and ev.get("tool_name") == "ExitPlanMode":
+            asyncio.create_task(self._relay_plan(env, str((ev.get("tool_input") or {}).get("plan", ""))))
+        elif name == "Stop":
             if env not in self._replied:
                 text = (ev.get("last_assistant_message") or "").strip() \
                     or _last_assistant_text(ev.get("transcript_path", ""))
@@ -614,7 +689,7 @@ class PluginClient:
             self._current = None
             self._pending_perms.clear()
         elif name == "Notification":
-            if self._pending_perms or self._dialog_sig or self._notice_pending:
+            if self._pending_perms or self._dialog_sig or self._hold_relay or self._ask:
                 return              # the relayed 🔐 / ❓ message already says it
             await self._reply(env, f"⏳ {ev.get('message', 'Claude wartet auf dich')}")
         elif name == "PreToolUse" and TOOL_STATUS:
@@ -703,6 +778,10 @@ class PluginClient:
             self._seen = set(list(self._seen)[-250:])
         self._envelope_channel[envelope_id] = channel_id
 
+        if self._ask and not text.startswith("/") and text.strip():
+            if not self._ask["future"].done():
+                self._ask["future"].set_result((text.strip(), envelope_id, channel_id))
+            return
         if text.strip().isdigit() and (dialog := _parse_dialog(self.claude.capture())):
             n = int(text.strip())
             if n in dialog["nav"]:
@@ -754,7 +833,7 @@ class PluginClient:
             except asyncio.TimeoutError:
                 await self._reply(envelope_id, "Claude-Channel nicht bereit (Bridge nicht verbunden). Siehe /log.", channel_id)
                 return
-        self._current = envelope_id
+        self._current = self._last_env = envelope_id
         self._replied.discard(envelope_id)
         self.last_progress_at = time.monotonic()
         _log(f"inject envelope={envelope_id} text={text[:120]!r}")
@@ -829,8 +908,8 @@ class PluginClient:
             self._dialog_sig = None
             return False
         sig = tuple(dialog["options"])
-        if not env or sig == self._dialog_sig or self._pending_perms:
-            return True
+        if not env or sig == self._dialog_sig or self._pending_perms or self._ask:
+            return True                     # nothing to do / already relayed / asked via hook
         self._dialog_sig = sig
         for i, opt in enumerate(dialog["options"], 1):
             if any(a in opt.lower() for a in AUTO_SELECT):
@@ -842,11 +921,112 @@ class PluginClient:
         await self._reply(env, f"{header}❓ Claude wartet auf deine Auswahl:\n```\n{_screen(pane, 25)}\n```\n{_dialog_prompt(dialog)}")
         return True
 
+    async def _ask_user(self, env: str, text: str) -> tuple[str, str, str]:
+        """Send a question, wait for the user's next message: (text, its envelope, channel)."""
+        async with self._ask_lock:
+            self._ask = {"future": asyncio.get_running_loop().create_future()}
+            try:
+                await self._reply(env, text)
+                return await self._ask["future"]
+            finally:
+                self._ask = None
+
+    async def on_hook_request(self, ev: dict) -> dict | None:
+        """PermissionRequest / AskUserQuestion: ask in sijba, return the hook decision."""
+        env = self._current or self._last_env
+        if not env:
+            return None                     # nobody to ask - the terminal dialog decides
+        self.last_progress_at = time.monotonic()
+        tool = ev.get("tool_name")
+        _log(f"hook {ev.get('hook_event_name')} {tool} - asking in sijba (envelope={env})")
+        try:
+            if tool == "AskUserQuestion":
+                return await self._ask_questions(env, ev.get("tool_input") or {})
+            return await self._ask_permission(env, ev)
+        except asyncio.CancelledError:
+            _log(f"hook {tool}: answered in the terminal or turn interrupted")
+            await self._reply(env, "ℹ️ Die Frage ist erledigt (im Terminal beantwortet oder abgebrochen).")
+            raise
+        finally:
+            self.last_progress_at = time.monotonic()
+
+    async def _ask_permission(self, env: str, ev: dict) -> dict:
+        tool = ev.get("tool_name") or "?"
+        sugg = ev.get("permission_suggestions") or []
+        rules = _describe_suggestions(sugg)
+        _log(f"permission {tool}: suggestions {json.dumps(sugg)[:200]}")
+        no = "3" if sugg else "2"
+        choices = ["  1 → Ja"] + ([f"  2 → Ja, und nicht mehr fragen für: {rules}"] if sugg else []) + [f"  {no} → Nein"]
+        text, aenv, ach = await self._ask_user(env, (
+            f"🔐 Claude möchte {tool} verwenden:\n```\n{_tool_summary(tool, ev.get('tool_input') or {})}\n```\n"
+            f"👉 Antworte mit der Zahl:\n" + "\n".join(choices) +
+            "\noder schreib Text = Nein, mit deiner Begründung an Claude."))
+        a = text.lower().strip(" .!")
+        decision: dict
+        if a in ("1", "ja", "j", "yes", "y", "ok"):
+            decision, ack = {"behavior": "allow"}, "✅ erlaubt"
+        elif sugg and a == "2":
+            decision, ack = {"behavior": "allow", "updatedPermissions": sugg}, f"✅ erlaubt, merke ich mir: {rules}"
+        elif a in (no, "nein", "n", "no"):
+            decision, ack = {"behavior": "deny", "message": "Der User hat das über sijba abgelehnt."}, "⛔ abgelehnt"
+        else:
+            decision = {"behavior": "deny", "message": f"Der User hat das über sijba abgelehnt: {text}"}
+            ack = "⛔ abgelehnt, deine Begründung geht an Claude"
+        _log(f"permission {tool}: {decision['behavior']}")
+        await self._reply(aenv, ack, ach)
+        return {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}}
+
+    async def _ask_questions(self, env: str, tin: dict) -> dict | None:
+        qs = tin.get("questions") or []
+        if not qs:
+            return None
+        answers: dict[str, str] = {}
+        for k, q in enumerate(qs, 1):
+            opts = q.get("options") or []
+            multi = bool(q.get("multiSelect"))
+            head = f"❓ Frage {k}/{len(qs)}" if len(qs) > 1 else "❓ Claude fragt"
+            lines = [f"  {i} → {o.get('label')}" + (f" — {o['description']}" if o.get("description") else "")
+                     for i, o in enumerate(opts, 1)]
+            how = "Mehrere möglich, z.B. 1,3" if multi else "Antworte mit der Zahl"
+            text, aenv, ach = await self._ask_user(env, (
+                f"{head}: {q.get('question')}\n" + "\n".join(lines) +
+                f"\n👉 {how} — oder schreib deine eigene Antwort."))
+            picks = re.findall(r"\d+", text) if re.fullmatch(r"[\d\s,;]+", text) else []
+            if picks and all(1 <= int(n) <= len(opts) for n in picks) and (multi or len(picks) == 1):
+                answer = ", ".join(opts[int(n) - 1].get("label", "") for n in dict.fromkeys(picks))
+            else:
+                answer = text
+            answers[q.get("question", "")] = answer
+            await self._reply(aenv, f"✅ {answer}", ach)
+        _log(f"AskUserQuestion answered ({len(answers)} question(s))")
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                       "updatedInput": {**tin, "answers": answers}}}
+
+    async def _relay_plan(self, env: str, plan: str) -> None:
+        """ExitPlanMode ignores a hook "allow", so the plan approval stays a terminal dialog:
+        send the plan text from the hook + the dialog's choices (answered via the pane)."""
+        self._hold_relay = True
+        try:
+            dialog = None
+            for _ in range(20):
+                if dialog := _parse_dialog(self.claude.capture()):
+                    break
+                await asyncio.sleep(0.5)
+            msg = f"📋 Claude schlägt diesen Plan vor:\n```\n{_truncate(plan.strip(), 3000)}\n```\n"
+            if dialog:
+                self._dialog_sig = tuple(dialog["options"])
+                msg += _dialog_prompt(dialog)
+            else:
+                msg += "/screen zeigt den Freigabe-Dialog."
+            await self._reply(env, msg)
+        finally:
+            self._hold_relay = False
+
     async def notice_then_dialog(self, env: str, notice: str, seconds: float = 15) -> None:
         """A safeguard notice is often followed by the model-switch dialog. Watch the pane
         for a moment and send ONE message: notice + dialog + what to answer, or - if no
         dialog shows up - just the notice."""
-        self._notice_pending = True
+        self._hold_relay = True
         header = f"⚠️ {notice}\n\n"
         try:
             end = time.monotonic() + seconds
@@ -856,12 +1036,12 @@ class PluginClient:
                 await asyncio.sleep(0.5)
             await self._reply(env, f"{header}Claude macht von selbst weiter — du musst nichts tun.")
         finally:
-            self._notice_pending = False
+            self._hold_relay = False
 
     async def _watch_dialogs(self) -> None:
         while not self.shutdown_event.is_set():
             await asyncio.sleep(3)
-            if self._current and not self._notice_pending:
+            if self._current and not self._hold_relay:
                 try:
                     await self._check_dialog()
                 except Exception as exc:
@@ -875,7 +1055,7 @@ class PluginClient:
         while not self.shutdown_event.is_set():
             await asyncio.sleep(10)
             env = self._current
-            if not env or self._pending_perms:
+            if not env or self._pending_perms or self._ask:
                 continue
             idle = time.monotonic() - self.last_progress_at
             if idle < STALL_SECS or self._stall_notified_at == self.last_progress_at:

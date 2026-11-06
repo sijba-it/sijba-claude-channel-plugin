@@ -48,7 +48,17 @@ Team/Enterprise: org policy `channelsEnabled` must allow channels.
   0 = off) *and* claude's spinner (`esc to interrupt`) is gone from the pane, one `⏳` message with the
   last pane lines is sent — a TUI dialog waiting for a keypress produces no event at all. Spinner
   visible = still working (long Bash command etc.), no warning. `/screen` shows the same state.
-- **TUI dialogs** (e.g. the model-switch prompt after a safeguard trip): while a turn runs the pane is
+- **Questions via hooks** (preferred, no screen scraping): `PermissionRequest` and `PreToolUse`
+  (AskUserQuestion) run `hook.py` blocking; main.py asks in sijba and returns the decision as hook output.
+  - permission (Bash/Edit/Write/MCP...): `1` allow, `2` allow + claude's suggestion (rule like `Bash(git push *)`
+    or accept-edits mode), `3`/`nein` deny, any other text = deny with that text as the reason for claude.
+  - AskUserQuestion: one sijba message per question; number, `1,3` for multi-select, or free text.
+  - plan approval (ExitPlanMode) ignores a hook "allow": the hook only delivers the plan text, the answer
+    goes to the terminal dialog via keys (see below).
+  - claude shows its own dialog in parallel; answering it in the terminal (or `/esc`) kills the hook ->
+    sijba gets "ℹ️ erledigt". Not answered from sijba -> the terminal dialog stays the fallback.
+  - `SIJBA_PERMISSION_RELAY=1` (channel permission relay) disables the PermissionRequest hook.
+- **TUI dialogs without a hook** (e.g. the model-switch prompt after a safeguard trip): while a turn runs the pane is
   checked every 3s (every 0.5s for 15s right after a safeguard notice); an open select dialog
   (`Enter to select` + numbered options) is relayed once with the screen 1:1 and `👉 Antworte mit der Zahl`;
   after a safeguard notice, notice + dialog arrive as ONE message. Reply with just the number — main.py
