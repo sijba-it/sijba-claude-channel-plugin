@@ -53,7 +53,13 @@ Team/Enterprise: org policy `channelsEnabled` must allow channels.
   (`Enter to select` + numbered options) is relayed once with the screen 1:1 and `👉 Antworte mit der Zahl`;
   after a safeguard notice, notice + dialog arrive as ONE message. Reply with just the number — main.py
   moves the cursor, presses Enter and shows the screen 2s later. Plain text while a dialog is open is
-  NOT injected (claude would only queue it) — you get the screen and the choices instead. `SIJBA_AUTO_SELECT="Stay on"`
+  NOT injected (claude would only queue it) — you get the screen and the choices instead.
+  Covered (tested live with claude 2.1.319): Bash/Edit/Write permission prompts, model switch,
+  AskUserQuestion (single, multi-select with `0` = Next/Submit, several questions incl. the
+  "Submit answers" page), plan approval, folder trust. Where the dialog takes free text
+  ("Type something", "Tell Claude what to change") plain text is typed in as that answer.
+  After an answer, a follow-up dialog is offered right away ("❓ Nächste Frage").
+  Note: in auto mode (user setting) most permission prompts never appear. `SIJBA_AUTO_SELECT="Stay on"`
   (comma list of option-label substrings) picks matching options unasked and reports it.
 - `claude` runs with `ENABLE_TOOL_SEARCH=false`: otherwise MCP tools are deferred, claude doesn't know
   the `reply` schema and answers in the terminal only.

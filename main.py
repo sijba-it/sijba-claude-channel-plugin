@@ -171,20 +171,40 @@ def _screen(pane: str, n: int = 40) -> str:
     return _truncate("\n".join(out[-n:]) or "(leerer Bildschirm)", 3500).replace("`" * 3, "´´´")
 
 
+def _free_text_option(dialog: dict) -> int | None:
+    """Option that takes typed text: AskUserQuestion's "Type something", plan approval's
+    "Tell Claude what to change"."""
+    return next((i + 1 for i, o in enumerate(dialog["options"])
+                 if "type something" in o.lower() or o.lower().startswith("tell claude")), None)
+
+
 def _dialog_prompt(dialog: dict) -> str:
     choices = "\n".join(f"  {i} → {o}" for i, o in enumerate(dialog["options"], 1))
-    return f"👉 Antworte mit der Zahl:\n{choices}\n(/esc bricht ab)"
+    free = _free_text_option(dialog) is not None
+    if 0 in dialog["nav"]:
+        choices += "\n  0 → Next / Submit (Auswahl bestätigen)"
+    return (f"👉 Antworte mit der Zahl:\n{choices}\n"
+            + ("oder schreib einfach deine eigene Antwort als Text.\n" if free else "") + "(/esc bricht ab)")
+
+
+DIALOG_FOOTER_RE = re.compile(r"enter to (select|confirm)|esc to cancel", re.I)
 
 
 def _parse_dialog(pane: str) -> dict | None:
-    """A claude select dialog at the bottom of the pane: numbered options, one marked
-    with ❯, and an "Enter to select" footer. Parsed bottom-up from the footer so numbered
-    lists in claude's own answer above it don't get mixed in. Returns question, options, cursor."""
+    """A claude select dialog at the bottom of the pane: options with a ❯ cursor and a
+    footer ("Enter to select" / "Enter to confirm" / "Esc to cancel"). Options are numbered
+    (permission prompts, model switch, AskUserQuestion) or plain (folder trust). Parsed
+    bottom-up from the footer so numbered lists in claude's own answer above it don't get
+    mixed in. Returns question, options, cursor (0-based)."""
     lines = [l for l in pane.splitlines() if l.strip()][-30:]
     foot = next((i for i in range(len(lines) - 1, max(-1, len(lines) - 5), -1)
-                 if "enter to select" in lines[i].lower()), None)
+                 if DIALOG_FOOTER_RE.search(lines[i])), None)
     if foot is None:
-        return None
+        # other pages have no such footer (AskUserQuestion's "Submit answers", plan approval
+        # with "ctrl+g to edit in Vim"): numbered options near the bottom, one under ❯
+        if not any((m := DIALOG_OPTION_RE.match(l)) and m.group(1) for l in lines[-8:]):
+            return None
+        foot = len(lines)
     found: dict[int, tuple[str, bool]] = {}
     first = None
     for i in range(foot - 1, -1, -1):
@@ -198,14 +218,43 @@ def _parse_dialog(pane: str) -> dict | None:
         first = i
         if n == 1:
             break
-    if 1 not in found or len(found) < 2:
-        return None
-    opts = [found[n][0] for n in sorted(found)]
-    cursor = next((n - 1 for n in sorted(found) if found[n][1]), 0)
+    nav: list[int] = []                 # cursor order on screen: option number, 0 = "Next"/"Submit"
+    cursor = 0
+    if 1 in found and len(found) >= 2:
+        opts = [found[n][0] for n in sorted(found)]
+        for i in range(first, foot):
+            m = DIALOG_OPTION_RE.match(lines[i])
+            bare = lines[i].replace("❯", "").strip()
+            if m and int(m.group(2)) in found:
+                nav.append(int(m.group(2)))
+            elif bare in ("Next", "Submit") and 0 not in nav:
+                nav.append(0)       # multi-select: confirms the ticked options
+            else:
+                continue
+            if "❯" in lines[i]:
+                cursor = len(nav) - 1
+    else:
+        # unnumbered: the ❯ line plus the neighbours whose text starts in the same column
+        cur = next((i for i in range(foot - 1, max(-1, foot - 12), -1) if "❯" in lines[i]
+                    and lines[i].split("❯", 1)[1].strip()), None)
+        if cur is None:
+            return None
+        col = len(lines[cur]) - len(lines[cur].split("❯", 1)[1].lstrip())
+        same = lambda l: len(l) > col and not l[:col].replace("❯", "").strip() and l[col] != " "
+        first, last = cur, cur
+        while first - 1 >= 0 and same(lines[first - 1]):
+            first -= 1
+        while last + 1 < foot and same(lines[last + 1]):
+            last += 1
+        opts = [lines[i][col:].strip() for i in range(first, last + 1)]
+        nav = list(range(1, len(opts) + 1))
+        cursor = cur - first
+        if len(opts) < 2:
+            return None
     above = lines[max(0, first - 8):first]
     boxed = [l for l in above if l.lstrip().startswith(("│", "|"))]
-    question = [l.strip(" │|╭╮╰╯─") for l in (boxed or above[-3:])]
-    return {"question": [q for q in question if q], "options": opts, "cursor": cursor}
+    question = [l.strip(" │|╭╮╰╯─╌") for l in (boxed or above[-3:])]
+    return {"question": [q for q in question if q], "options": opts, "nav": nav, "cursor": cursor}
 
 
 class ClaudeTmux:
@@ -273,9 +322,12 @@ class ClaudeTmux:
         return any("esc to interrupt" in l.lower() for l in lines[-10:])
 
     def select(self, dialog: dict, n: int) -> None:
-        """Move the ❯ cursor to option n (1-based) and confirm."""
-        delta = (n - 1) - dialog["cursor"]
+        """Move the ❯ cursor to option n (1-based; 0 = multi-select "Next") and confirm."""
+        delta = dialog["nav"].index(n) - dialog["cursor"]
         self.keys(*(["Down"] * delta if delta > 0 else ["Up"] * -delta), "Enter")
+
+    def type_text(self, text: str) -> None:
+        _tmux("send-keys", "-t", TMUX_SESSION, "-l", text)
 
     def keys(self, *keys: str) -> None:
         _tmux("send-keys", "-t", TMUX_SESSION, *keys)
@@ -627,6 +679,17 @@ class PluginClient:
             await self._reply(envelope_id, "Commands: /archive /pause /reset /esc /screen [n] /key <keys> /attach /log [n] /trace [n]. Anything else: plain text.", channel_id)
         return True
 
+    async def _after_answer(self, envelope_id: str, channel_id: str, head: str) -> None:
+        """Show what the answer did - and if the next question/dialog is already up, offer it."""
+        await asyncio.sleep(2)
+        pane = self.claude.capture()
+        if dialog := _parse_dialog(pane):
+            self._dialog_sig = tuple(dialog["options"])
+            await self._reply(envelope_id, f"{head}\n\n❓ Nächste Frage:\n```\n{_screen(pane, 25)}\n```\n{_dialog_prompt(dialog)}", channel_id)
+            return
+        state = "🔄 Claude arbeitet weiter" if self.claude.busy(pane) else "Bildschirm jetzt:"
+        await self._reply(envelope_id, f"{head}\n{state}\n```\n{_screen(pane, 20)}\n```", channel_id)
+
     async def handle_message(self, msg: dict) -> None:
         channel_id = msg["channel"]
         payload = msg["payload"]
@@ -642,15 +705,13 @@ class PluginClient:
 
         if text.strip().isdigit() and (dialog := _parse_dialog(self.claude.capture())):
             n = int(text.strip())
-            if 1 <= n <= len(dialog["options"]):
+            if n in dialog["nav"]:
                 self.claude.select(dialog, n)
                 self.last_progress_at = time.monotonic()
                 self._dialog_sig = None
-                _log(f"dialog: user picked {n}. {dialog['options'][n - 1]}")
-                await asyncio.sleep(2)
-                pane = self.claude.capture()
-                state = "🔄 Claude arbeitet weiter" if self.claude.busy(pane) else "Bildschirm jetzt:"
-                await self._reply(envelope_id, f"✅ {n} → {dialog['options'][n - 1]}\n{state}\n```\n{_screen(pane, 20)}\n```", channel_id)
+                label = dialog["options"][n - 1] if n else "Next"
+                _log(f"dialog: user picked {n}. {label}")
+                await self._after_answer(envelope_id, channel_id, f"✅ {n} → {label}")
                 return
         if m := PERM_REPLY_RE.match(text):
             rid = m.group(2).lower()
@@ -668,6 +729,20 @@ class PluginClient:
             await self._reply(envelope_id, "", channel_id)
             return
         if dialog := _parse_dialog(pane := self.claude.capture()):
+            free = _free_text_option(dialog)
+            if free is not None:
+                # AskUserQuestion: plain text = the free-form answer
+                delta = dialog["nav"].index(free) - dialog["cursor"]
+                self.claude.keys(*(["Down"] * delta if delta > 0 else ["Up"] * -delta))
+                await asyncio.sleep(0.3)
+                self.claude.type_text(" ".join(text.split()))
+                await asyncio.sleep(0.3)
+                self.claude.keys("Enter")
+                self.last_progress_at = time.monotonic()
+                self._dialog_sig = None
+                _log("dialog: user answered with free text")
+                await self._after_answer(envelope_id, channel_id, "✅ als freie Antwort eingetragen")
+                return
             # claude would just queue it behind the dialog - nothing would visibly happen
             await self._reply(envelope_id, (
                 f"✋ Claude hängt gerade in einer Auswahl, deine Nachricht wurde NICHT weitergegeben.\n"
