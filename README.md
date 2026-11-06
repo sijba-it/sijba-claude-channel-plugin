@@ -60,11 +60,11 @@ Team/Enterprise: org policy `channelsEnabled` must allow channels.
   - plan approval (ExitPlanMode) ignores a hook "allow": the hook only delivers the plan text, the answer
     goes to the terminal dialog via keys (see below).
   - claude shows its own dialog in parallel; answering it in the terminal (or `/esc`) kills the hook ->
-    sijba gets "ℹ️ erledigt". Not answered from sijba -> the terminal dialog stays the fallback.
+    sijba gets "ℹ️ Question settled". Not answered from sijba -> the terminal dialog stays the fallback.
   - `SIJBA_PERMISSION_RELAY=1` (channel permission relay) disables the PermissionRequest hook.
 - **TUI dialogs without a hook** (e.g. the model-switch prompt after a safeguard trip): while a turn runs the pane is
   checked every 3s (every 0.5s for 15s right after a safeguard notice); an open select dialog
-  (`Enter to select` + numbered options) is relayed once with the screen 1:1 and `👉 Antworte mit der Zahl`;
+  (`Enter to select` + numbered options) is relayed once with the screen 1:1 and `👉 Reply with the number`;
   after a safeguard notice, notice + dialog arrive as ONE message. Reply with just the number — main.py
   moves the cursor, presses Enter and shows the screen 2s later. Plain text while a dialog is open is
   NOT injected (claude would only queue it) — you get the screen and the choices instead.
@@ -72,7 +72,7 @@ Team/Enterprise: org policy `channelsEnabled` must allow channels.
   AskUserQuestion (single, multi-select with `0` = Next/Submit, several questions incl. the
   "Submit answers" page), plan approval, folder trust. Where the dialog takes free text
   ("Type something", "Tell Claude what to change") plain text is typed in as that answer.
-  After an answer, a follow-up dialog is offered right away ("❓ Nächste Frage").
+  After an answer, a follow-up dialog is offered right away ("❓ Next question").
   Note: in auto mode (user setting) most permission prompts never appear. `SIJBA_AUTO_SELECT="Stay on"`
   (comma list of option-label substrings) picks matching options unasked and reports it.
 - `claude` runs with `ENABLE_TOOL_SEARCH=false`: otherwise MCP tools are deferred, claude doesn't know
@@ -81,7 +81,7 @@ Team/Enterprise: org policy `channelsEnabled` must allow channels.
 ## Status
 Verified live (claude 2.1.319, Pro login, fake sijba server): channel event injection, `reply` tool,
 Stop-hook fallback (also after killing the bridge mid-turn), Notification hook, **permission relay**
-end to end (Bash `rm` in default mode -> `🔐 Freigabe nötig ... yes <id>` in sijba -> allowed, file deleted).
+end to end (Bash `rm` in default mode -> `🔐 Approval needed ... yes <id>` in sijba -> allowed, file deleted).
 Unit-tested: transcript watcher delivering the text of a failed `reply` call.
 Auto mode (`--permission-mode auto`) allowed file writes outside WORK_DIR and a passwordless `sudo apt-get`
 without any prompt ("Allowed by auto mode") - nothing reaches sijba there because nothing is asked.

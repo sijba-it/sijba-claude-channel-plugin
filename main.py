@@ -168,7 +168,7 @@ def _screen(pane: str, n: int = 40) -> str:
             out.append(l)
     while out and not out[-1]:
         out.pop()
-    return _truncate("\n".join(out[-n:]) or "(leerer Bildschirm)", 3500).replace("`" * 3, "´´´")
+    return _truncate("\n".join(out[-n:]) or "(empty screen)", 3500).replace("`" * 3, "´´´")
 
 
 def _rel(path: object) -> str:
@@ -198,8 +198,8 @@ def _tool_summary(tool: str, tin: dict) -> str:
 
 def _describe_suggestions(sugg: list[dict]) -> str:
     """claude's "don't ask again" proposals (permission_suggestions) in words."""
-    modes = {"acceptEdits": "alle Datei-Änderungen in dieser Session (accept edits)",
-             "bypassPermissions": "alles ohne Rückfrage (bypass)", "plan": "Plan-Modus"}
+    modes = {"acceptEdits": "all file edits in this session (accept edits)",
+             "bypassPermissions": "everything without asking (bypass)", "plan": "plan mode"}
     parts = []
     for sg in sugg:
         t = sg.get("type")
@@ -207,12 +207,12 @@ def _describe_suggestions(sugg: list[dict]) -> str:
             parts += [f"{r.get('toolName')}({r['ruleContent']})" if r.get("ruleContent") else str(r.get("toolName"))
                       for r in sg.get("rules", [])]
         elif t == "setMode":
-            parts.append(modes.get(sg.get("mode"), f"Modus {sg.get('mode')}"))
+            parts.append(modes.get(sg.get("mode"), f"mode {sg.get('mode')}"))
         elif t == "addDirectories":
-            parts.append("Zugriff auf " + ", ".join(map(str, sg.get("directories", []))))
+            parts.append("access to " + ", ".join(map(str, sg.get("directories", []))))
         else:
             parts.append(str(t))
-    return "; ".join(parts) or "dieses Tool"
+    return "; ".join(parts) or "this tool"
 
 
 LOGIN_SCREENS = ("choose the text style", "select login method", "paste code here", "oauth error")
@@ -252,9 +252,9 @@ def _dialog_prompt(dialog: dict) -> str:
     choices = "\n".join(f"  {i} → {o}" for i, o in enumerate(dialog["options"], 1))
     free = _free_text_option(dialog) is not None
     if 0 in dialog["nav"]:
-        choices += "\n  0 → Next / Submit (Auswahl bestätigen)"
-    return (f"👉 Antworte mit der Zahl:\n{choices}\n"
-            + ("oder schreib einfach deine eigene Antwort als Text.\n" if free else "") + "(/esc bricht ab)")
+        choices += "\n  0 → Next / Submit (confirm selection)"
+    return (f"👉 Reply with the number:\n{choices}\n"
+            + ("or just write your own answer as text.\n" if free else "") + "(/esc cancels)")
 
 
 DIALOG_FOOTER_RE = re.compile(r"enter to (select|confirm)|esc to cancel", re.I)
@@ -693,8 +693,8 @@ class PluginClient:
             return
         preview = m.get("input_preview") or m.get("description") or ""
         await self._reply(env, (
-            f"🔐 Freigabe nötig: {m['tool_name']}\n{_truncate(preview, 1500)}\n\n"
-            f"Antwort: `yes {rid}` oder `no {rid}`"
+            f"🔐 Approval needed: {m['tool_name']}\n{_truncate(preview, 1500)}\n\n"
+            f"Reply: `yes {rid}` or `no {rid}`"
         ))
 
     async def on_hook(self, ev: dict) -> None:
@@ -718,7 +718,7 @@ class PluginClient:
         elif name == "Notification":
             if self._pending_perms or self._dialog_sig or self._hold_relay or self._ask:
                 return              # the relayed 🔐 / ❓ message already says it
-            await self._reply(env, f"⏳ {ev.get('message', 'Claude wartet auf dich')}")
+            await self._reply(env, f"⏳ {ev.get('message', 'Claude is waiting for you')}")
         elif name == "PreToolUse" and TOOL_STATUS:
             tin = ev.get("tool_input") or {}
             hint = tin.get("command") or tin.get("file_path") or tin.get("pattern") or ""
@@ -758,8 +758,8 @@ class PluginClient:
             n = min(int(rest.strip()), 100) if rest.strip().isdigit() else 40
             pane = self.claude.capture()
             dialog = _parse_dialog(pane)
-            state = ("❓ wartet auf deine Auswahl" if dialog else "🔄 arbeitet" if self.claude.busy(pane)
-                     else "💤 bereit" if not self._current else "⏸ wartet (kein Spinner)")
+            state = ("❓ waiting for your choice" if dialog else "🔄 working" if self.claude.busy(pane)
+                     else "💤 ready" if not self._current else "⏸ waiting (no spinner)")
             msg = f"{state}\n```\n{_screen(pane, n)}\n```"
             if dialog:
                 self._dialog_sig = tuple(dialog["options"])
@@ -789,9 +789,9 @@ class PluginClient:
         pane = self.claude.capture()
         if dialog := _parse_dialog(pane):
             self._dialog_sig = tuple(dialog["options"])
-            await self._reply(envelope_id, f"{head}\n\n❓ Nächste Frage:\n```\n{_screen(pane, 25)}\n```\n{_dialog_prompt(dialog)}", channel_id)
+            await self._reply(envelope_id, f"{head}\n\n❓ Next question:\n```\n{_screen(pane, 25)}\n```\n{_dialog_prompt(dialog)}", channel_id)
             return
-        state = "🔄 Claude arbeitet weiter" if self.claude.busy(pane) else "Bildschirm jetzt:"
+        state = "🔄 Claude is working again" if self.claude.busy(pane) else "Screen now:"
         await self._reply(envelope_id, f"{head}\n{state}\n```\n{_screen(pane, 20)}\n```", channel_id)
 
     async def handle_message(self, msg: dict) -> None:
@@ -828,7 +828,7 @@ class PluginClient:
                 self._pending_perms.pop(rid)
                 await self.bridge.send({"type": "permission_verdict", "request_id": rid,
                                         "behavior": "allow" if allow else "deny"})
-                await self._reply(envelope_id, f"{'✅ erlaubt' if allow else '⛔ abgelehnt'} ({rid})", channel_id)
+                await self._reply(envelope_id, f"{'✅ allowed' if allow else '⛔ denied'} ({rid})", channel_id)
                 return
         if text.startswith("/"):
             if await self._handle_local_command(channel_id, envelope_id, text):
@@ -849,12 +849,12 @@ class PluginClient:
                 self.last_progress_at = time.monotonic()
                 self._dialog_sig = None
                 _log("dialog: user answered with free text")
-                await self._after_answer(envelope_id, channel_id, "✅ als freie Antwort eingetragen")
+                await self._after_answer(envelope_id, channel_id, "✅ entered as your own answer")
                 return
             # claude would just queue it behind the dialog - nothing would visibly happen
             await self._reply(envelope_id, (
-                f"✋ Claude hängt gerade in einer Auswahl, deine Nachricht wurde NICHT weitergegeben.\n"
-                f"```\n{_screen(pane, 25)}\n```\n{_dialog_prompt(dialog)}\nDanach die Nachricht nochmal schicken."), channel_id)
+                f"✋ Claude is stuck in a choice dialog, your message was NOT passed on.\n"
+                f"```\n{_screen(pane, 25)}\n```\n{_dialog_prompt(dialog)}\nThen send your message again."), channel_id)
             return
         if _needs_login(self.claude.capture()):
             # not logged in (fresh install or logged out mid-session): log in, then deliver
@@ -864,7 +864,7 @@ class PluginClient:
             try:
                 await asyncio.wait_for(self.bridge.connected.wait(), timeout=90)
             except asyncio.TimeoutError:
-                await self._reply(envelope_id, "Claude-Channel nicht bereit (Bridge nicht verbunden). Siehe /log.", channel_id)
+                await self._reply(envelope_id, "Claude channel not ready (bridge not connected). See /log.", channel_id)
                 return
         self._current = self._last_env = envelope_id
         self._replied.discard(envelope_id)
@@ -948,17 +948,17 @@ class PluginClient:
             if any(a in opt.lower() for a in AUTO_SELECT):
                 self.claude.select(dialog, i)
                 _log(f"dialog: auto-selected {i}. {opt}")
-                await self._reply(env, f"{header}🤖 Dialog automatisch beantwortet: {i} → {opt}")
+                await self._reply(env, f"{header}🤖 Dialog answered automatically: {i} → {opt}")
                 return True
         _log(f"dialog relayed: {sig}")
-        await self._reply(env, f"{header}❓ Claude wartet auf deine Auswahl:\n```\n{_screen(pane, 25)}\n```\n{_dialog_prompt(dialog)}")
+        await self._reply(env, f"{header}❓ Claude is waiting for your choice:\n```\n{_screen(pane, 25)}\n```\n{_dialog_prompt(dialog)}")
         return True
 
     async def login_flow(self, env: str, channel_id: str) -> bool:
         """Drive claude's login screens from sijba: pick the subscription login, send the
         OAuth link, type in the code the user sends back. True when logged in."""
         if self._login_running:
-            await self._reply(env, "🔑 Login läuft schon — schick den Code aus dem Link.", channel_id)
+            await self._reply(env, "🔑 Login already in progress — send the code from the link.", channel_id)
             return False
         self._login_running = True
         _log("login flow started")
@@ -976,7 +976,7 @@ class PluginClient:
                 low = pane.lower()
                 if "oauth error" in low:
                     err = next((l.strip() for l in pane.splitlines() if "oauth error" in l.lower()), "")
-                    await self._reply(env, f"❌ {err}\nIch hole einen neuen Link…", channel_id)
+                    await self._reply(env, f"❌ {err}\nGetting a new link…", channel_id)
                     self.claude.keys("Enter")
                     await asyncio.sleep(3)
                 elif "choose the text style" in low or "select login method" in low or "press enter to continue" in low:
@@ -984,9 +984,9 @@ class PluginClient:
                     await asyncio.sleep(2)
                 elif "paste code here" in low and (url := _login_url(pane)):
                     text, _, _ = await self._ask_user(env, (
-                        "🔑 Claude muss sich einloggen.\n"
-                        f"1. Link öffnen und mit deinem Claude-Konto anmelden:\n{url}\n"
-                        "2. Den Code, der danach angezeigt wird, hier als Nachricht schicken."))
+                        "🔑 Claude needs to log in.\n"
+                        f"1. Open the link and sign in with your Claude account:\n{url}\n"
+                        "2. Send the code shown afterwards here as a message."))
                     self.claude.type_text(text.strip())
                     await asyncio.sleep(0.3)
                     self.claude.keys("Enter")
@@ -995,7 +995,7 @@ class PluginClient:
                     quiet += 1
                     if quiet >= 3:                    # login screens gone for a few seconds
                         _log("login flow: logged in")
-                        await self._reply(env, "✅ Claude ist eingeloggt.", channel_id)
+                        await self._reply(env, "✅ Claude is logged in.", channel_id)
                         asyncio.create_task(self.claude.accept_startup_dialogs())
                         return True
                     await asyncio.sleep(1)
@@ -1003,7 +1003,7 @@ class PluginClient:
                 else:
                     await asyncio.sleep(1)
                 quiet = 0
-            await self._reply(env, f"⏱ Login abgebrochen.\n```\n{_screen(self.claude.capture(), 20)}\n```", channel_id)
+            await self._reply(env, f"⏱ Login cancelled.\n```\n{_screen(self.claude.capture(), 20)}\n```", channel_id)
             return False
         finally:
             self._login_running = False
@@ -1032,7 +1032,7 @@ class PluginClient:
             return await self._ask_permission(env, ev)
         except asyncio.CancelledError:
             _log(f"hook {tool}: answered in the terminal or turn interrupted")
-            await self._reply(env, "ℹ️ Die Frage ist erledigt (im Terminal beantwortet oder abgebrochen).")
+            await self._reply(env, "ℹ️ Question settled (answered in the terminal or cancelled).")
             raise
         finally:
             self.last_progress_at = time.monotonic()
@@ -1043,22 +1043,22 @@ class PluginClient:
         rules = _describe_suggestions(sugg)
         _log(f"permission {tool}: suggestions {json.dumps(sugg)[:200]}")
         no = "3" if sugg else "2"
-        choices = ["  1 → Ja"] + ([f"  2 → Ja, und nicht mehr fragen für: {rules}"] if sugg else []) + [f"  {no} → Nein"]
+        choices = ["  1 → Yes"] + ([f"  2 → Yes, and don't ask again for: {rules}"] if sugg else []) + [f"  {no} → No"]
         text, aenv, ach = await self._ask_user(env, (
-            f"🔐 Claude möchte {tool} verwenden:\n```\n{_tool_summary(tool, ev.get('tool_input') or {})}\n```\n"
-            f"👉 Antworte mit der Zahl:\n" + "\n".join(choices) +
-            "\noder schreib Text = Nein, mit deiner Begründung an Claude."))
+            f"🔐 Claude wants to use {tool}:\n```\n{_tool_summary(tool, ev.get('tool_input') or {})}\n```\n"
+            f"👉 Reply with the number:\n" + "\n".join(choices) +
+            "\nor write text = No, with your reason passed on to Claude."))
         a = text.lower().strip(" .!")
         decision: dict
         if a in ("1", "ja", "j", "yes", "y", "ok"):
-            decision, ack = {"behavior": "allow"}, "✅ erlaubt"
+            decision, ack = {"behavior": "allow"}, "✅ allowed"
         elif sugg and a == "2":
-            decision, ack = {"behavior": "allow", "updatedPermissions": sugg}, f"✅ erlaubt, merke ich mir: {rules}"
+            decision, ack = {"behavior": "allow", "updatedPermissions": sugg}, f"✅ allowed, remembered: {rules}"
         elif a in (no, "nein", "n", "no"):
-            decision, ack = {"behavior": "deny", "message": "Der User hat das über sijba abgelehnt."}, "⛔ abgelehnt"
+            decision, ack = {"behavior": "deny", "message": "The user denied this via sijba."}, "⛔ denied"
         else:
-            decision = {"behavior": "deny", "message": f"Der User hat das über sijba abgelehnt: {text}"}
-            ack = "⛔ abgelehnt, deine Begründung geht an Claude"
+            decision = {"behavior": "deny", "message": f"The user denied this via sijba: {text}"}
+            ack = "⛔ denied, your reason was passed on to Claude"
         _log(f"permission {tool}: {decision['behavior']}")
         await self._reply(aenv, ack, ach)
         return {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}}
@@ -1071,13 +1071,13 @@ class PluginClient:
         for k, q in enumerate(qs, 1):
             opts = q.get("options") or []
             multi = bool(q.get("multiSelect"))
-            head = f"❓ Frage {k}/{len(qs)}" if len(qs) > 1 else "❓ Claude fragt"
+            head = f"❓ Question {k}/{len(qs)}" if len(qs) > 1 else "❓ Claude asks"
             lines = [f"  {i} → {o.get('label')}" + (f" — {o['description']}" if o.get("description") else "")
                      for i, o in enumerate(opts, 1)]
-            how = "Mehrere möglich, z.B. 1,3" if multi else "Antworte mit der Zahl"
+            how = "Several allowed, e.g. 1,3" if multi else "Reply with the number"
             text, aenv, ach = await self._ask_user(env, (
                 f"{head}: {q.get('question')}\n" + "\n".join(lines) +
-                f"\n👉 {how} — oder schreib deine eigene Antwort."))
+                f"\n👉 {how} — or write your own answer."))
             picks = re.findall(r"\d+", text) if re.fullmatch(r"[\d\s,;]+", text) else []
             if picks and all(1 <= int(n) <= len(opts) for n in picks) and (multi or len(picks) == 1):
                 answer = ", ".join(opts[int(n) - 1].get("label", "") for n in dict.fromkeys(picks))
@@ -1099,12 +1099,12 @@ class PluginClient:
                 if dialog := _parse_dialog(self.claude.capture()):
                     break
                 await asyncio.sleep(0.5)
-            msg = f"📋 Claude schlägt diesen Plan vor:\n```\n{_truncate(plan.strip(), 3000)}\n```\n"
+            msg = f"📋 Claude proposes this plan:\n```\n{_truncate(plan.strip(), 3000)}\n```\n"
             if dialog:
                 self._dialog_sig = tuple(dialog["options"])
                 msg += _dialog_prompt(dialog)
             else:
-                msg += "/screen zeigt den Freigabe-Dialog."
+                msg += "/screen shows the approval dialog."
             await self._reply(env, msg)
         finally:
             self._hold_relay = False
@@ -1121,7 +1121,7 @@ class PluginClient:
                 if await self._check_dialog(header):
                     return
                 await asyncio.sleep(0.5)
-            await self._reply(env, f"{header}Claude macht von selbst weiter — du musst nichts tun.")
+            await self._reply(env, f"{header}Claude carries on by itself — nothing to do.")
         finally:
             self._hold_relay = False
 
@@ -1153,9 +1153,9 @@ class PluginClient:
             self._stall_notified_at = self.last_progress_at
             _log(f"stall: no progress for {int(idle)}s (envelope={env})")
             await self._reply(env, (
-                f"⏳ Seit {int(idle)}s passiert nichts und Claude arbeitet nicht. So sieht's aus:\n"
+                f"⏳ Nothing has happened for {int(idle)}s and Claude is not working. This is the screen:\n"
                 f"```\n{_screen(pane, 25)}\n```\n"
-                f"👉 Tasten schicken mit /key (z.B. /key Enter, /key 1, /key Escape) oder /esc zum Abbrechen."))
+                f"👉 Send keys with /key (e.g. /key Enter, /key 1, /key Escape) or /esc to cancel."))
 
     async def run_forever(self) -> None:
         loop = asyncio.get_event_loop()
