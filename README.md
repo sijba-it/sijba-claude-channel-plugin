@@ -50,8 +50,10 @@ Team/Enterprise: org policy `channelsEnabled` must allow channels.
   visible = still working (long Bash command etc.), no warning. `/screen` shows the same state.
 - **TUI dialogs** (e.g. the model-switch prompt after a safeguard trip): while a turn runs the pane is
   checked every 3s (every 0.5s for 15s right after a safeguard notice); an open select dialog
-  (`Enter to select` + numbered options) is relayed once as `❓ Claude fragt: ... 1. ... 2. ...`.
-  Reply with just the number — main.py moves the cursor and presses Enter. `SIJBA_AUTO_SELECT="Stay on"`
+  (`Enter to select` + numbered options) is relayed once with the screen 1:1 and `👉 Antworte mit der Zahl`;
+  after a safeguard notice, notice + dialog arrive as ONE message. Reply with just the number — main.py
+  moves the cursor, presses Enter and shows the screen 2s later. Plain text while a dialog is open is
+  NOT injected (claude would only queue it) — you get the screen and the choices instead. `SIJBA_AUTO_SELECT="Stay on"`
   (comma list of option-label substrings) picks matching options unasked and reports it.
 - `claude` runs with `ENABLE_TOOL_SEARCH=false`: otherwise MCP tools are deferred, claude doesn't know
   the `reply` schema and answers in the terminal only.

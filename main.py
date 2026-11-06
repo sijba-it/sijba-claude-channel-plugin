@@ -159,6 +159,23 @@ def _tmux(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["tmux", *args], capture_output=True, text=True)
 
 
+def _screen(pane: str, n: int = 40) -> str:
+    """The pane as it looks (last n lines, blank-line runs collapsed) for a ``` block."""
+    out: list[str] = []
+    for l in pane.splitlines():
+        l = l.rstrip()
+        if l or (out and out[-1]):
+            out.append(l)
+    while out and not out[-1]:
+        out.pop()
+    return _truncate("\n".join(out[-n:]) or "(leerer Bildschirm)", 3500).replace("`" * 3, "´´´")
+
+
+def _dialog_prompt(dialog: dict) -> str:
+    choices = "\n".join(f"  {i} → {o}" for i, o in enumerate(dialog["options"], 1))
+    return f"👉 Antworte mit der Zahl:\n{choices}\n(/esc bricht ab)"
+
+
 def _parse_dialog(pane: str) -> dict | None:
     """A claude select dialog at the bottom of the pane: numbered options, one marked
     with ❯, and an "Enter to select" footer. Parsed bottom-up from the footer so numbered
@@ -382,9 +399,7 @@ class TranscriptWatcher:
         env = self.client._current
         _log(f"system notice in transcript (envelope={env}): {content[:160]}")
         if env:
-            await self.client._reply(env, f"⚠️ {content.strip()}\n(Info — Claude macht von selbst weiter.)")
-            # a safeguard trip is often followed by the model-switch dialog: look right away
-            asyncio.create_task(self.client.scan_dialog_soon())
+            asyncio.create_task(self.client.notice_then_dialog(env, content.strip()))
 
     async def _event(self, d: dict) -> None:
         content = (d.get("message") or {}).get("content")
@@ -497,6 +512,7 @@ class PluginClient:
         self.last_progress_at = time.monotonic()      # last hook / transcript line seen
         self._stall_notified_at: float | None = None  # last_progress_at value we already warned about
         self._dialog_sig: tuple | None = None         # options of the TUI dialog already relayed
+        self._notice_pending = False                  # notice_then_dialog() is still watching
         self.watcher = TranscriptWatcher(self)
 
     # -- sijba out -------------------------------------------------------
@@ -546,8 +562,8 @@ class PluginClient:
             self._current = None
             self._pending_perms.clear()
         elif name == "Notification":
-            if self._pending_perms:
-                return              # the relayed 🔐 message already says it
+            if self._pending_perms or self._dialog_sig or self._notice_pending:
+                return              # the relayed 🔐 / ❓ message already says it
             await self._reply(env, f"⏳ {ev.get('message', 'Claude wartet auf dich')}")
         elif name == "PreToolUse" and TOOL_STATUS:
             tin = ev.get("tool_input") or {}
@@ -585,15 +601,16 @@ class PluginClient:
             self.claude.keys("Escape")
             await self._reply(envelope_id, "Escape sent (interrupts the running turn).", channel_id)
         elif cmd == "screen":
-            n = min(int(rest.strip()), 100) if rest.strip().isdigit() else 25
+            n = min(int(rest.strip()), 100) if rest.strip().isdigit() else 40
             pane = self.claude.capture()
-            lines = [l for l in pane.splitlines() if l.strip()][-n:]
-            if dialog := _parse_dialog(pane):
+            dialog = _parse_dialog(pane)
+            state = ("❓ wartet auf deine Auswahl" if dialog else "🔄 arbeitet" if self.claude.busy(pane)
+                     else "💤 bereit" if not self._current else "⏸ wartet (kein Spinner)")
+            msg = f"{state}\n```\n{_screen(pane, n)}\n```"
+            if dialog:
                 self._dialog_sig = tuple(dialog["options"])
-                opts = "\n".join(f"{i}. {o}" for i, o in enumerate(dialog["options"], 1))
-                await self._reply(envelope_id, f"❓ Dialog offen:\n{opts}\n\nAntworte mit der Zahl.", channel_id)
-            state = "🔄 arbeitet" if self.claude.busy(pane) else ("💤 idle" if not self._current else "⏸ wartet (kein Spinner)")
-            await self._reply(envelope_id, f"{state}\n```\n" + _truncate("\n".join(lines) or "(empty pane)", 3000) + "\n```", channel_id)
+                msg += "\n" + _dialog_prompt(dialog)
+            await self._reply(envelope_id, msg, channel_id)
         elif cmd == "key":
             # tmux key names, space separated: "1", "Enter", "Down Enter", "C-c"
             keys = rest.split()
@@ -602,9 +619,8 @@ class PluginClient:
                 return True
             self.claude.keys(*keys)
             self.last_progress_at = time.monotonic()
-            await asyncio.sleep(1)
-            lines = [l for l in self.claude.capture().splitlines() if l.strip()][-10:]
-            await self._reply(envelope_id, f"keys sent: {' '.join(keys)}\n```\n" + _truncate("\n".join(lines), 1500) + "\n```", channel_id)
+            await asyncio.sleep(1.5)
+            await self._reply(envelope_id, f"⌨️ {' '.join(keys)}\n```\n{_screen(self.claude.capture(), 25)}\n```", channel_id)
         elif cmd == "attach":
             await self._reply(envelope_id, f"tmux attach -t {TMUX_SESSION}", channel_id)
         else:
@@ -629,7 +645,12 @@ class PluginClient:
             if 1 <= n <= len(dialog["options"]):
                 self.claude.select(dialog, n)
                 self.last_progress_at = time.monotonic()
-                await self._reply(envelope_id, f"✅ gewählt: {n}. {dialog['options'][n - 1]}", channel_id)
+                self._dialog_sig = None
+                _log(f"dialog: user picked {n}. {dialog['options'][n - 1]}")
+                await asyncio.sleep(2)
+                pane = self.claude.capture()
+                state = "🔄 Claude arbeitet weiter" if self.claude.busy(pane) else "Bildschirm jetzt:"
+                await self._reply(envelope_id, f"✅ {n} → {dialog['options'][n - 1]}\n{state}\n```\n{_screen(pane, 20)}\n```", channel_id)
                 return
         if m := PERM_REPLY_RE.match(text):
             rid = m.group(2).lower()
@@ -645,6 +666,12 @@ class PluginClient:
                 return
         if not text:
             await self._reply(envelope_id, "", channel_id)
+            return
+        if dialog := _parse_dialog(pane := self.claude.capture()):
+            # claude would just queue it behind the dialog - nothing would visibly happen
+            await self._reply(envelope_id, (
+                f"✋ Claude hängt gerade in einer Auswahl, deine Nachricht wurde NICHT weitergegeben.\n"
+                f"```\n{_screen(pane, 25)}\n```\n{_dialog_prompt(dialog)}\nDanach die Nachricht nochmal schicken."), channel_id)
             return
         if not self.bridge.connected.is_set():
             try:
@@ -717,11 +744,12 @@ class PluginClient:
                 self.exit_code = self.exit_code or 1
                 self._request_shutdown()
 
-    async def _check_dialog(self) -> bool:
-        """Relay a newly opened TUI select dialog to sijba (or auto-pick per SIJBA_AUTO_SELECT).
-        True if a dialog is open."""
+    async def _check_dialog(self, header: str = "") -> bool:
+        """Relay a newly opened TUI select dialog to sijba (or auto-pick per SIJBA_AUTO_SELECT),
+        screen 1:1 plus what to answer. True if a dialog is open."""
         env = self._current
-        dialog = _parse_dialog(self.claude.capture())
+        pane = self.claude.capture()
+        dialog = _parse_dialog(pane)
         if not dialog:
             self._dialog_sig = None
             return False
@@ -733,25 +761,32 @@ class PluginClient:
             if any(a in opt.lower() for a in AUTO_SELECT):
                 self.claude.select(dialog, i)
                 _log(f"dialog: auto-selected {i}. {opt}")
-                await self._reply(env, f"🤖 Dialog automatisch beantwortet: {i}. {opt}")
+                await self._reply(env, f"{header}🤖 Dialog automatisch beantwortet: {i} → {opt}")
                 return True
         _log(f"dialog relayed: {sig}")
-        opts = "\n".join(f"{i}. {o}" for i, o in enumerate(dialog["options"], 1))
-        await self._reply(env, (f"❓ Claude fragt:\n{_truncate(chr(10).join(dialog['question']), 800)}\n\n"
-                                f"{opts}\n\nAntworte mit der Zahl (oder /esc zum Abbrechen)."))
+        await self._reply(env, f"{header}❓ Claude wartet auf deine Auswahl:\n```\n{_screen(pane, 25)}\n```\n{_dialog_prompt(dialog)}")
         return True
 
-    async def scan_dialog_soon(self, seconds: float = 15) -> None:
-        end = time.monotonic() + seconds
-        while time.monotonic() < end:
-            if await self._check_dialog():
-                return
-            await asyncio.sleep(0.5)
+    async def notice_then_dialog(self, env: str, notice: str, seconds: float = 15) -> None:
+        """A safeguard notice is often followed by the model-switch dialog. Watch the pane
+        for a moment and send ONE message: notice + dialog + what to answer, or - if no
+        dialog shows up - just the notice."""
+        self._notice_pending = True
+        header = f"⚠️ {notice}\n\n"
+        try:
+            end = time.monotonic() + seconds
+            while time.monotonic() < end:
+                if await self._check_dialog(header):
+                    return
+                await asyncio.sleep(0.5)
+            await self._reply(env, f"{header}Claude macht von selbst weiter — du musst nichts tun.")
+        finally:
+            self._notice_pending = False
 
     async def _watch_dialogs(self) -> None:
         while not self.shutdown_event.is_set():
             await asyncio.sleep(3)
-            if self._current:
+            if self._current and not self._notice_pending:
                 try:
                     await self._check_dialog()
                 except Exception as exc:
@@ -774,13 +809,11 @@ class PluginClient:
             if self.claude.busy(pane) or self._dialog_sig:
                 continue                    # still working, or the dialog was already relayed
             self._stall_notified_at = self.last_progress_at
-            lines = [l for l in pane.splitlines() if l.strip()][-15:]
             _log(f"stall: no progress for {int(idle)}s (envelope={env})")
-            msg = (f"⏳ seit {int(idle)}s keine Aktivität und kein Spinner — vermutlich wartet ein TUI-Dialog. "
-                   f"Antworten mit /key <tasten> (z.B. /key 1, /key Enter), /screen zeigt den Pane, /esc bricht ab.")
-            if lines:
-                msg += "\n\n```\n" + _truncate("\n".join(lines), 1500) + "\n```"
-            await self._reply(env, msg)
+            await self._reply(env, (
+                f"⏳ Seit {int(idle)}s passiert nichts und Claude arbeitet nicht. So sieht's aus:\n"
+                f"```\n{_screen(pane, 25)}\n```\n"
+                f"👉 Tasten schicken mit /key (z.B. /key Enter, /key 1, /key Escape) oder /esc zum Abbrechen."))
 
     async def run_forever(self) -> None:
         loop = asyncio.get_event_loop()
