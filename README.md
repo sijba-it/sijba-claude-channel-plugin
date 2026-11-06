@@ -48,6 +48,10 @@ Team/Enterprise: org policy `channelsEnabled` must allow channels.
   0 = off) *and* claude's spinner (`esc to interrupt`) is gone from the pane, one `⏳` message with the
   last pane lines is sent — a TUI dialog waiting for a keypress produces no event at all. Spinner
   visible = still working (long Bash command etc.), no warning. `/screen` shows the same state.
+- **Login from sijba**: if claude isn't logged in (fresh install, or "Not logged in" in its status line
+  after the session expired) the next sijba message - or `/login` - starts the login: theme/method
+  screens get their defaults (subscription login), the OAuth link is sent to sijba, the code the user
+  sends back is typed in (invalid code -> new link). Afterwards the waiting message is delivered.
 - **Questions via hooks** (preferred, no screen scraping): `PermissionRequest` and `PreToolUse`
   (AskUserQuestion) run `hook.py` blocking; main.py asks in sijba and returns the decision as hook output.
   - permission (Bash/Edit/Write/MCP...): `1` allow, `2` allow + claude's suggestion (rule like `Bash(git push *)`

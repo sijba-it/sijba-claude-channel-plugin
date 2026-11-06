@@ -215,6 +215,32 @@ def _describe_suggestions(sugg: list[dict]) -> str:
     return "; ".join(parts) or "dieses Tool"
 
 
+LOGIN_SCREENS = ("choose the text style", "select login method", "paste code here", "oauth error")
+
+
+def _login_url(pane: str) -> str | None:
+    """The OAuth URL of claude's login screen - hard-wrapped over several lines."""
+    lines = pane.splitlines()
+    for i, l in enumerate(lines):
+        if l.strip().startswith("https://") and "oauth" in l:
+            url = l.strip()
+            for nxt in lines[i + 1:]:
+                t = nxt.strip()
+                if not t or " " in t:
+                    break
+                url += t
+            return url
+    return None
+
+
+def _needs_login(pane: str) -> bool:
+    """A login screen at the bottom, or claude's status line saying "Not logged in" -
+    only the bottom lines, so an answer that merely mentions logins doesn't count."""
+    lines = [l.lower() for l in pane.splitlines() if l.strip()]
+    return any(m in l for l in lines[-15:] for m in LOGIN_SCREENS) or \
+        any("not logged in" in l for l in lines[-4:])
+
+
 def _free_text_option(dialog: dict) -> int | None:
     """Option that takes typed text: AskUserQuestion's "Type something", plan approval's
     "Tell Claude what to change"."""
@@ -638,6 +664,7 @@ class PluginClient:
         self._ask: dict | None = None                 # question waiting for the user's next message
         self._ask_lock = asyncio.Lock()               # parallel tool calls -> one question at a time
         self._last_env: str | None = None             # fallback when a hook fires outside a known turn
+        self._login_running = False
         self.watcher = TranscriptWatcher(self)
 
     # -- sijba out -------------------------------------------------------
@@ -748,10 +775,12 @@ class PluginClient:
             self.last_progress_at = time.monotonic()
             await asyncio.sleep(1.5)
             await self._reply(envelope_id, f"⌨️ {' '.join(keys)}\n```\n{_screen(self.claude.capture(), 25)}\n```", channel_id)
+        elif cmd == "login":
+            asyncio.create_task(self.login_flow(envelope_id, channel_id))
         elif cmd == "attach":
             await self._reply(envelope_id, f"tmux attach -t {TMUX_SESSION}", channel_id)
         else:
-            await self._reply(envelope_id, "Commands: /archive /pause /reset /esc /screen [n] /key <keys> /attach /log [n] /trace [n]. Anything else: plain text.", channel_id)
+            await self._reply(envelope_id, "Commands: /archive /pause /reset /esc /screen [n] /key <keys> /login /attach /log [n] /trace [n]. Anything else: plain text.", channel_id)
         return True
 
     async def _after_answer(self, envelope_id: str, channel_id: str, head: str) -> None:
@@ -827,6 +856,10 @@ class PluginClient:
                 f"✋ Claude hängt gerade in einer Auswahl, deine Nachricht wurde NICHT weitergegeben.\n"
                 f"```\n{_screen(pane, 25)}\n```\n{_dialog_prompt(dialog)}\nDanach die Nachricht nochmal schicken."), channel_id)
             return
+        if _needs_login(self.claude.capture()):
+            # not logged in (fresh install or logged out mid-session): log in, then deliver
+            if not await self.login_flow(envelope_id, channel_id):
+                return
         if not self.bridge.connected.is_set():
             try:
                 await asyncio.wait_for(self.bridge.connected.wait(), timeout=90)
@@ -858,7 +891,7 @@ class PluginClient:
             "channels": {CHANNEL_ID: {
                 "label": f"Claude (channel): {PROJECT_NAME}",
                 "hint": (f"Interactive Claude Code via Channels for '{PROJECT_NAME}' at {WORK_DIR}. "
-                         f"Trigger: '{PROJECT_NAME} ...'. Commands: /archive /pause /reset /esc /screen [n] /key <keys> /attach /log [n] /trace [n]."),
+                         f"Trigger: '{PROJECT_NAME} ...'. Commands: /archive /pause /reset /esc /screen [n] /key <keys> /login /attach /log [n] /trace [n]."),
                 "triggers": [PROJECT_NAME, CHANNEL_ID],
                 "capabilities": ["code", "analysis", "debugging", "files", "terminal"],
                 "metadata": {"plugin": PLUGIN_NAME, "project": PROJECT_NAME, "working_dir": str(WORK_DIR)},
@@ -920,6 +953,60 @@ class PluginClient:
         _log(f"dialog relayed: {sig}")
         await self._reply(env, f"{header}❓ Claude wartet auf deine Auswahl:\n```\n{_screen(pane, 25)}\n```\n{_dialog_prompt(dialog)}")
         return True
+
+    async def login_flow(self, env: str, channel_id: str) -> bool:
+        """Drive claude's login screens from sijba: pick the subscription login, send the
+        OAuth link, type in the code the user sends back. True when logged in."""
+        if self._login_running:
+            await self._reply(env, "🔑 Login läuft schon — schick den Code aus dem Link.", channel_id)
+            return False
+        self._login_running = True
+        _log("login flow started")
+        try:
+            pane = self.claude.capture()
+            if _needs_login(pane) and not any(m in pane.lower() for m in LOGIN_SCREENS):
+                self.claude.type_text("/login")       # logged out mid-session: open the login screen
+                await asyncio.sleep(0.3)
+                self.claude.keys("Enter")
+                await asyncio.sleep(2)
+            deadline = time.monotonic() + 900
+            quiet = 0
+            while time.monotonic() < deadline:
+                pane = self.claude.capture()
+                low = pane.lower()
+                if "oauth error" in low:
+                    err = next((l.strip() for l in pane.splitlines() if "oauth error" in l.lower()), "")
+                    await self._reply(env, f"❌ {err}\nIch hole einen neuen Link…", channel_id)
+                    self.claude.keys("Enter")
+                    await asyncio.sleep(3)
+                elif "choose the text style" in low or "select login method" in low or "press enter to continue" in low:
+                    self.claude.keys("Enter")         # defaults: theme, subscription login, notices
+                    await asyncio.sleep(2)
+                elif "paste code here" in low and (url := _login_url(pane)):
+                    text, _, _ = await self._ask_user(env, (
+                        "🔑 Claude muss sich einloggen.\n"
+                        f"1. Link öffnen und mit deinem Claude-Konto anmelden:\n{url}\n"
+                        "2. Den Code, der danach angezeigt wird, hier als Nachricht schicken."))
+                    self.claude.type_text(text.strip())
+                    await asyncio.sleep(0.3)
+                    self.claude.keys("Enter")
+                    await asyncio.sleep(6)
+                elif not _needs_login(pane):
+                    quiet += 1
+                    if quiet >= 3:                    # login screens gone for a few seconds
+                        _log("login flow: logged in")
+                        await self._reply(env, "✅ Claude ist eingeloggt.", channel_id)
+                        asyncio.create_task(self.claude.accept_startup_dialogs())
+                        return True
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    await asyncio.sleep(1)
+                quiet = 0
+            await self._reply(env, f"⏱ Login abgebrochen.\n```\n{_screen(self.claude.capture(), 20)}\n```", channel_id)
+            return False
+        finally:
+            self._login_running = False
 
     async def _ask_user(self, env: str, text: str) -> tuple[str, str, str]:
         """Send a question, wait for the user's next message: (text, its envelope, channel)."""
