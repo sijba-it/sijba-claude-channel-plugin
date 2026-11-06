@@ -46,6 +46,11 @@ Team/Enterprise: org policy `channelsEnabled` must allow channels.
   0 = off) *and* claude's spinner (`esc to interrupt`) is gone from the pane, one `⏳` message with the
   last pane lines is sent — a TUI dialog waiting for a keypress produces no event at all. Spinner
   visible = still working (long Bash command etc.), no warning. `/screen` shows the same state.
+- **TUI dialogs** (e.g. the model-switch prompt after a safeguard trip): while a turn runs the pane is
+  checked every 3s (every 0.5s for 15s right after a safeguard notice); an open select dialog
+  (`Enter to select` + numbered options) is relayed once as `❓ Claude fragt: ... 1. ... 2. ...`.
+  Reply with just the number — main.py moves the cursor and presses Enter. `SIJBA_AUTO_SELECT="Stay on"`
+  (comma list of option-label substrings) picks matching options unasked and reports it.
 - `claude` runs with `ENABLE_TOOL_SEARCH=false`: otherwise MCP tools are deferred, claude doesn't know
   the `reply` schema and answers in the terminal only.
 

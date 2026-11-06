@@ -19,7 +19,8 @@ protocol:
 
 Env: SIJBA_URL SIJBA_TOKEN PROJECT_NAME WORK_DIR REGISTRY_FILE  (controller contract)
      CLAUDE_CMD (default claude), SIJBA_PERMISSION_RELAY=1, SIJBA_TOOL_STATUS=1,
-     CLAUDE_EXTRA_ARGS (e.g. "--model sonnet"), SIJBA_STALL_SECS (default 45, 0 = off)
+     CLAUDE_EXTRA_ARGS (e.g. "--model sonnet"), SIJBA_STALL_SECS (default 45, 0 = off),
+     SIJBA_AUTO_SELECT (comma list of option labels to pick unasked in TUI dialogs, e.g. "Stay on")
 """
 from __future__ import annotations
 
@@ -56,6 +57,8 @@ PERMISSION_RELAY = os.environ.get("SIJBA_PERMISSION_RELAY") == "1"
 TOOL_STATUS = os.environ.get("SIJBA_TOOL_STATUS") == "1"
 TRUST_WORKDIR = os.environ.get("SIJBA_TRUST_WORKDIR") == "1"
 STALL_SECS = int(os.environ.get("SIJBA_STALL_SECS", "45"))
+AUTO_SELECT = [x.strip().lower() for x in os.environ.get("SIJBA_AUTO_SELECT", "").split(",") if x.strip()]
+DIALOG_OPTION_RE = re.compile(r"^\s*[│|]?\s*(❯)?\s*(\d+)\.\s+(.+?)\s*[│|]?\s*$")
 
 for _name, _ok in (("SIJBA_TOKEN", SIJBA_TOKEN), ("PROJECT_NAME", PROJECT_NAME),
                    ("REGISTRY_FILE", REGISTRY_FILE)):
@@ -156,6 +159,38 @@ def _tmux(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["tmux", *args], capture_output=True, text=True)
 
 
+def _parse_dialog(pane: str) -> dict | None:
+    """A claude select dialog at the bottom of the pane: numbered options, one marked
+    with ❯, and an "Enter to select" footer. Parsed bottom-up from the footer so numbered
+    lists in claude's own answer above it don't get mixed in. Returns question, options, cursor."""
+    lines = [l for l in pane.splitlines() if l.strip()][-30:]
+    foot = next((i for i in range(len(lines) - 1, max(-1, len(lines) - 5), -1)
+                 if "enter to select" in lines[i].lower()), None)
+    if foot is None:
+        return None
+    found: dict[int, tuple[str, bool]] = {}
+    first = None
+    for i in range(foot - 1, -1, -1):
+        m = DIALOG_OPTION_RE.match(lines[i])
+        if not m:
+            continue                    # wrapped option text / description lines
+        n = int(m.group(2))
+        if found and n != min(found) - 1:
+            break
+        found[n] = (m.group(3).strip(), bool(m.group(1)))
+        first = i
+        if n == 1:
+            break
+    if 1 not in found or len(found) < 2:
+        return None
+    opts = [found[n][0] for n in sorted(found)]
+    cursor = next((n - 1 for n in sorted(found) if found[n][1]), 0)
+    above = lines[max(0, first - 8):first]
+    boxed = [l for l in above if l.lstrip().startswith(("│", "|"))]
+    question = [l.strip(" │|╭╮╰╯─") for l in (boxed or above[-3:])]
+    return {"question": [q for q in question if q], "options": opts, "cursor": cursor}
+
+
 class ClaudeTmux:
     def has_session(self) -> bool:
         return _tmux("has-session", "-t", TMUX_SESSION).returncode == 0
@@ -206,6 +241,11 @@ class ClaudeTmux:
         turn runs - incl. long tool calls. Dialogs say "esc to cancel" instead."""
         lines = [l for l in (pane if pane is not None else self.capture()).splitlines() if l.strip()]
         return any("esc to interrupt" in l.lower() for l in lines[-10:])
+
+    def select(self, dialog: dict, n: int) -> None:
+        """Move the ❯ cursor to option n (1-based) and confirm."""
+        delta = (n - 1) - dialog["cursor"]
+        self.keys(*(["Down"] * delta if delta > 0 else ["Up"] * -delta), "Enter")
 
     def keys(self, *keys: str) -> None:
         _tmux("send-keys", "-t", TMUX_SESSION, *keys)
@@ -329,7 +369,9 @@ class TranscriptWatcher:
         env = self.client._current
         _log(f"system notice in transcript (envelope={env}): {content[:160]}")
         if env:
-            await self.client._reply(env, f"⚠️ {content.strip()}")
+            await self.client._reply(env, f"⚠️ {content.strip()}\n(Info — Claude macht von selbst weiter.)")
+            # a safeguard trip is often followed by the model-switch dialog: look right away
+            asyncio.create_task(self.client.scan_dialog_soon())
 
     async def _event(self, d: dict) -> None:
         content = (d.get("message") or {}).get("content")
@@ -441,6 +483,7 @@ class PluginClient:
         self._pending_perms: dict[str, dict] = {}
         self.last_progress_at = time.monotonic()      # last hook / transcript line seen
         self._stall_notified_at: float | None = None  # last_progress_at value we already warned about
+        self._dialog_sig: tuple | None = None         # options of the TUI dialog already relayed
         self.watcher = TranscriptWatcher(self)
 
     # -- sijba out -------------------------------------------------------
@@ -532,6 +575,10 @@ class PluginClient:
             n = min(int(rest.strip()), 100) if rest.strip().isdigit() else 25
             pane = self.claude.capture()
             lines = [l for l in pane.splitlines() if l.strip()][-n:]
+            if dialog := _parse_dialog(pane):
+                self._dialog_sig = tuple(dialog["options"])
+                opts = "\n".join(f"{i}. {o}" for i, o in enumerate(dialog["options"], 1))
+                await self._reply(envelope_id, f"❓ Dialog offen:\n{opts}\n\nAntworte mit der Zahl.", channel_id)
             state = "🔄 arbeitet" if self.claude.busy(pane) else ("💤 idle" if not self._current else "⏸ wartet (kein Spinner)")
             await self._reply(envelope_id, f"{state}\n```\n" + _truncate("\n".join(lines) or "(empty pane)", 3000) + "\n```", channel_id)
         elif cmd == "key":
@@ -564,6 +611,13 @@ class PluginClient:
             self._seen = set(list(self._seen)[-250:])
         self._envelope_channel[envelope_id] = channel_id
 
+        if text.strip().isdigit() and (dialog := _parse_dialog(self.claude.capture())):
+            n = int(text.strip())
+            if 1 <= n <= len(dialog["options"]):
+                self.claude.select(dialog, n)
+                self.last_progress_at = time.monotonic()
+                await self._reply(envelope_id, f"✅ gewählt: {n}. {dialog['options'][n - 1]}", channel_id)
+                return
         if m := PERM_REPLY_RE.match(text):
             rid = m.group(2).lower()
             if rid in self._pending_perms:
@@ -646,6 +700,46 @@ class PluginClient:
                 self.exit_code = self.exit_code or 1
                 self._request_shutdown()
 
+    async def _check_dialog(self) -> bool:
+        """Relay a newly opened TUI select dialog to sijba (or auto-pick per SIJBA_AUTO_SELECT).
+        True if a dialog is open."""
+        env = self._current
+        dialog = _parse_dialog(self.claude.capture())
+        if not dialog:
+            self._dialog_sig = None
+            return False
+        sig = tuple(dialog["options"])
+        if not env or sig == self._dialog_sig or self._pending_perms:
+            return True
+        self._dialog_sig = sig
+        for i, opt in enumerate(dialog["options"], 1):
+            if any(a in opt.lower() for a in AUTO_SELECT):
+                self.claude.select(dialog, i)
+                _log(f"dialog: auto-selected {i}. {opt}")
+                await self._reply(env, f"🤖 Dialog automatisch beantwortet: {i}. {opt}")
+                return True
+        _log(f"dialog relayed: {sig}")
+        opts = "\n".join(f"{i}. {o}" for i, o in enumerate(dialog["options"], 1))
+        await self._reply(env, (f"❓ Claude fragt:\n{_truncate(chr(10).join(dialog['question']), 800)}\n\n"
+                                f"{opts}\n\nAntworte mit der Zahl (oder /esc zum Abbrechen)."))
+        return True
+
+    async def scan_dialog_soon(self, seconds: float = 15) -> None:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if await self._check_dialog():
+                return
+            await asyncio.sleep(0.5)
+
+    async def _watch_dialogs(self) -> None:
+        while not self.shutdown_event.is_set():
+            await asyncio.sleep(3)
+            if self._current:
+                try:
+                    await self._check_dialog()
+                except Exception as exc:
+                    _log(f"dialog check error: {exc}")
+
     async def _watch_stall(self) -> None:
         """A TUI dialog waiting for a keypress (e.g. the model-switch prompt after a
         safeguard trip) leaves no hook and no transcript line - only silence. Warn once
@@ -660,8 +754,8 @@ class PluginClient:
             if idle < STALL_SECS or self._stall_notified_at == self.last_progress_at:
                 continue
             pane = self.claude.capture()
-            if self.claude.busy(pane):
-                continue
+            if self.claude.busy(pane) or self._dialog_sig:
+                continue                    # still working, or the dialog was already relayed
             self._stall_notified_at = self.last_progress_at
             lines = [l for l in pane.splitlines() if l.strip()][-15:]
             _log(f"stall: no progress for {int(idle)}s (envelope={env})")
@@ -679,6 +773,7 @@ class PluginClient:
         self.claude.start()
         asyncio.create_task(self.claude.accept_startup_dialogs())
         asyncio.create_task(self._watch_tmux())
+        asyncio.create_task(self._watch_dialogs())
         if STALL_SECS > 0:
             asyncio.create_task(self._watch_stall())
         asyncio.create_task(self.watcher.run())
