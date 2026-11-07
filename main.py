@@ -46,7 +46,11 @@ EXIT_PAUSED = 91
 PLUGIN_NAME = "claude-channel"
 HERE = Path(__file__).resolve().parent
 
-SIJBA_URL = os.environ.get("SIJBA_URL", "wss://sijba.edv-bartl.at")
+SIJBA_URL = os.environ.get("SIJBA_URL", "")
+if not SIJBA_URL:
+    print("ERROR: SIJBA_URL environment variable required (e.g. wss://<account>.sijba.eu)", file=sys.stderr)
+    sys.exit(1)
+
 SIJBA_TOKEN = os.environ.get("SIJBA_TOKEN", "")
 PROJECT_NAME = os.environ.get("PROJECT_NAME", "")
 WORK_DIR = Path(os.environ.get("WORK_DIR", ""))
