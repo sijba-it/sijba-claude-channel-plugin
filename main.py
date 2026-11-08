@@ -919,8 +919,9 @@ class PluginClient:
     async def connect(self) -> None:
         ws_url = SIJBA_URL.replace("https://", "wss://").replace("http://", "ws://")
         _log(f"Connecting to {ws_url} as {PLUGIN_ID}")
-        self.ws = await websockets.connect(f"{ws_url}/api/plugin/ws?token={SIJBA_TOKEN}",
-                                           ping_interval=30, ping_timeout=60, close_timeout=5)
+        self.ws = await websockets.connect(f"{ws_url}/api/plugin/ws",
+                                           ping_interval=30, ping_timeout=60, close_timeout=5,
+                                           additional_headers={"Authorization": f"Bearer {SIJBA_TOKEN}"})
         await self.ws.send(json.dumps({
             "type": "register", "plugin_id": PLUGIN_ID,
             "capabilities": ["conversation", "tools", "files", "code", "agent"],
